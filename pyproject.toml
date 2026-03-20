@@ -1,0 +1,43 @@
+[project]
+name = "openplot"
+version = "1.0.0"
+description = "Makes plotting and fine-tuning plots easy and interactive."
+readme = "README.md"
+authors = [{ name = "Philo Wu", email = "philo.wu@codeboyphilo.ai" }]
+requires-python = ">=3.12"
+dependencies = [
+  "fastapi>=0.115.0",
+  "uvicorn[standard]>=0.30.0",
+  "websockets>=13.0",
+  "click>=8.1.0",
+  "pydantic>=2.0.0",
+  "mcp>=1.26.0",
+  "numpy>=2.4.2",
+  "pandas>=3.0.1",
+  "matplotlib>=3.10.8",
+  "seaborn>=0.13.2",
+  "openpyxl>=3.1.5",
+]
+
+[project.scripts]
+openplot = "openplot.cli:main"
+openplot-desktop = "openplot.desktop:main"
+
+[project.optional-dependencies]
+desktop = [
+  "pywebview>=5.2; platform_system != 'Linux'",
+  "pywebview[qt]>=5.2; platform_system == 'Linux'",
+  "pyobjc-core>=11.1; platform_system == 'Darwin'",
+  "pyobjc-framework-Cocoa>=11.1; platform_system == 'Darwin'",
+  "pyobjc-framework-Quartz>=11.1; platform_system == 'Darwin'",
+  "pyobjc-framework-Security>=11.1; platform_system == 'Darwin'",
+  "pyobjc-framework-WebKit>=11.1; platform_system == 'Darwin'",
+]
+
+[build-system]
+requires = ["uv_build>=0.10.6,<0.11.0"]
+build-backend = "uv_build"
+
+[dependency-groups]
+dev = ["ruff>=0.8.0", "pytest>=8.0.0"]
+packaging = ["pyinstaller>=6.16.0"]

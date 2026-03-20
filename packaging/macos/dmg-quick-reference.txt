@@ -1,0 +1,9 @@
+OpenPlot Install Quick Reference
+
+1. Drag OpenPlot.app onto Applications.
+2. Wait for the copy to finish.
+3. Open Applications and launch OpenPlot.
+4. Eject the OpenPlot disk image when you are done.
+
+Tip: If macOS asks for confirmation the first time you open OpenPlot,
+click Open to continue.

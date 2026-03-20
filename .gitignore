@@ -1,0 +1,40 @@
+# Python-generated files
+__pycache__/
+*.py[oc]
+/OpenPlot.spec
+build/
+dist/
+wheels/
+*.egg-info
+
+# Virtual environments
+.venv
+
+# Built frontend (bundled into Python package at build time)
+src/openplot/static/
+
+# Frontend
+frontend/node_modules/
+frontend/dist/
+
+# Test artifacts
+examples/*.svg
+examples/*.png
+examples/*.jpg
+examples/*.pdf
+
+# openplot runtime
+.openplot/
+*.bak
+
+# Nix
+result
+
+# Dev
+node_modules/
+.worktrees/
+.opencode
+docs/
+
+# Misc
+.DS_Store

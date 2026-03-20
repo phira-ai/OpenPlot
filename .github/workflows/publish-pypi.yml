@@ -1,0 +1,50 @@
+name: publish-pypi
+
+on:
+  workflow_dispatch:
+  push:
+    tags:
+      - "v*"
+
+permissions:
+  contents: read
+
+jobs:
+  publish:
+    runs-on: ubuntu-22.04
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Set up Node
+        uses: actions/setup-node@v4
+        with:
+          node-version: "22"
+
+      - name: Set up uv
+        uses: astral-sh/setup-uv@v5
+
+      - name: Build frontend assets
+        run: |
+          npm ci --prefix frontend
+          npm run build --prefix frontend
+
+      - name: Build Python distributions
+        run: uv build
+
+      - name: Verify wheel contains frontend assets
+        run: |
+          python packaging/python/verify_python_dist.py \
+            --source-static-dir src/openplot/static \
+            --dist-dir dist
+
+      - name: Publish to PyPI
+        env:
+          UV_PUBLISH_TOKEN: ${{ secrets.PYPI_API_TOKEN }}
+        run: uv publish

@@ -1,0 +1,9 @@
+[Desktop Entry]
+Type=Application
+Name=OpenPlot
+Comment=Visual plot debugger for LLM-generated plotting scripts
+Exec=openplot-desktop %F
+Icon=openplot
+Terminal=false
+Categories=Graphics;
+StartupWMClass=OpenPlot
