@@ -68,7 +68,7 @@
           pname = "openplot-frontend";
           version = "1.0.0";
           src = ./frontend;
-          npmDepsHash = "sha256-rUhfSCiC6CwdPX1iHj/VlAXW7qtqz28GdetOLav9hMU=";
+          npmDepsHash = "sha256-cV/TWZrmoF/o9Y50+SKXnl4nE4IsNUPXIUzTQyPCVW0=";
           npmBuildScript = "build";
 
           installPhase = ''
