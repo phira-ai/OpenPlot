@@ -1,7 +1,8 @@
 from __future__ import annotations
 
-from pathlib import Path
 import json
+from pathlib import Path
+import re
 import tomllib
 
 import openplot
@@ -47,3 +48,11 @@ def test_frontend_lockfile_version_matches_pyproject() -> None:
 
 def test_server_module_uses_package_version_binding() -> None:
     assert server.__version__ == openplot.__version__
+
+
+def test_flake_contains_single_npm_deps_hash_binding() -> None:
+    flake_contents = (Path(__file__).resolve().parents[1] / "flake.nix").read_text(
+        encoding="utf-8"
+    )
+
+    assert len(re.findall(r'(?m)^\s*npmDepsHash\s*=\s*"[^"]+";', flake_contents)) == 1
