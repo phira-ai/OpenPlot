@@ -11,6 +11,8 @@ import SessionSidebar from "./components/SessionSidebar";
 import Toolbar from "./components/Toolbar";
 import FeedbackSidebar from "./components/FeedbackSidebar";
 import FixStepLiveModal from "./components/FixStepLiveModal";
+import RunnerAuthDialog from "./components/RunnerAuthDialog";
+import RunnerManager from "./components/RunnerManager";
 import NotificationBubbleStack, {
   type NotificationBubble,
 } from "./components/NotificationBubbleStack";
@@ -19,6 +21,13 @@ import WalkthroughTour from "./components/WalkthroughTour";
 import PlotModeWalkthroughTour from "./components/PlotModeWalkthroughTour";
 import { Button } from "@/components/ui/button";
 import { Card, CardContent, CardDescription, CardTitle } from "@/components/ui/card";
+import {
+  Dialog,
+  DialogContent,
+  DialogDescription,
+  DialogHeader,
+  DialogTitle,
+} from "@/components/ui/dialog";
 import {
   ResizableHandle,
   ResizablePanel,
@@ -167,6 +176,9 @@ function App() {
     selectedRunner,
     setSelectedRunner,
     availableRunners,
+    runnerStatus,
+    runnerStatusLoading,
+    runnerStatusError,
     backendFatalError,
     opencodeModels,
     defaultOpencodeModel,
@@ -190,7 +202,11 @@ function App() {
     startFixJob,
     cancelFixJob,
     updateFixPreferences,
+    installRunner,
+    launchRunnerAuth,
+    openExternalUrl,
     refreshPythonInterpreter,
+    refreshRunnerAvailability,
     setPythonInterpreterPreference,
     fetchPlotModePathSuggestions,
     selectPlotModePaths,
@@ -234,6 +250,17 @@ function App() {
   const [isPlotRegionHovered, setIsPlotRegionHovered] = useState(false);
   const [uiZoom, setUiZoom] = useState(() => loadUiZoom());
   const notificationTimersRef = useRef<Map<string, number>>(new Map());
+  const [showRunnerManager, setShowRunnerManager] = useState(false);
+  const [runnerManagerError, setRunnerManagerError] = useState<string | null>(null);
+  const [runnerAuthEntry, setRunnerAuthEntry] = useState<
+    NonNullable<typeof runnerStatus> extends { runners: infer R }
+      ? R extends Array<infer T>
+        ? T | null
+        : null
+      : null
+  >(null);
+  const [runnerAuthLaunching, setRunnerAuthLaunching] = useState(false);
+  const [runnerAuthError, setRunnerAuthError] = useState<string | null>(null);
 
   const activePlotWorkspaceId = plotMode?.id ?? null;
   const activePlotWorkspaceActions = useMemo(
@@ -966,6 +993,60 @@ function App() {
     [setPythonInterpreterPreference],
   );
 
+  const handleInstallRunner = useCallback(
+    async (runner: FixRunner) => {
+      setRunnerManagerError(null);
+      try {
+        await installRunner(runner);
+      } catch (err: unknown) {
+        setRunnerManagerError(asErrorMessage(err, `Failed to install ${runner}`));
+      }
+    },
+    [installRunner],
+  );
+
+  const handleAuthenticateRunner = useCallback((entry: NonNullable<typeof runnerAuthEntry>) => {
+    setRunnerManagerError(null);
+    setRunnerAuthError(null);
+    setRunnerAuthEntry(entry);
+  }, []);
+
+  const handleConfirmRunnerAuth = useCallback(async () => {
+    if (!runnerAuthEntry) {
+      return;
+    }
+    setRunnerAuthLaunching(true);
+    setRunnerAuthError(null);
+    try {
+      await launchRunnerAuth(runnerAuthEntry.runner);
+      setRunnerAuthEntry(null);
+    } catch (err: unknown) {
+      setRunnerAuthError(
+        asErrorMessage(err, `Failed to start ${runnerAuthEntry.runner} authentication`),
+      );
+    } finally {
+      setRunnerAuthLaunching(false);
+    }
+  }, [launchRunnerAuth, runnerAuthEntry]);
+
+  const handleOpenRunnerGuide = useCallback(
+    async (url: string) => {
+      setRunnerManagerError(null);
+      try {
+        await openExternalUrl(url);
+      } catch (err: unknown) {
+        setRunnerManagerError(asErrorMessage(err, "Failed to open runner guide"));
+      }
+    },
+    [openExternalUrl],
+  );
+
+  const handleRefreshRunners = useCallback(async () => {
+    setRunnerManagerError(null);
+    setRunnerAuthError(null);
+    await refreshRunnerAvailability();
+  }, [refreshRunnerAvailability]);
+
   const handleFetchPlotModePathSuggestions = useCallback(
     async (query: string, selectionType: PlotModePathSelectionType) => {
       return await fetchPlotModePathSuggestions(plotMode?.id ?? null, query, selectionType);
@@ -1134,6 +1215,47 @@ function App() {
     }
   }, [finalizePlotMode, plotMode?.current_script, plotMode?.id, updatePlotWorkspaceActions]);
 
+  const runnerManagerDialog = runnerStatus ? (
+    <Dialog open={showRunnerManager} onOpenChange={setShowRunnerManager}>
+      <DialogContent className="max-h-[85vh] max-w-6xl overflow-y-auto p-0" showCloseButton>
+        <DialogHeader className="border-b border-border/70 px-6 py-5">
+          <DialogTitle>Manage runners</DialogTitle>
+          <DialogDescription>
+            Add or review the runners OpenPlot can use on this machine.
+          </DialogDescription>
+        </DialogHeader>
+        <div className="p-6">
+          <RunnerManager
+            runners={runnerStatus.runners}
+            loading={runnerStatusLoading}
+            error={runnerManagerError ?? runnerStatusError}
+            onInstall={handleInstallRunner}
+            onAuthenticate={handleAuthenticateRunner}
+            onOpenGuide={handleOpenRunnerGuide}
+            onRefresh={handleRefreshRunners}
+          />
+        </div>
+      </DialogContent>
+    </Dialog>
+  ) : null;
+
+  const runnerAuthDialog = (
+    <RunnerAuthDialog
+      open={runnerAuthEntry !== null}
+      entry={runnerAuthEntry}
+      launching={runnerAuthLaunching}
+      error={runnerAuthError}
+      onOpenChange={(open) => {
+        if (!open) {
+          setRunnerAuthEntry(null);
+          setRunnerAuthLaunching(false);
+          setRunnerAuthError(null);
+        }
+      }}
+      onConfirm={handleConfirmRunnerAuth}
+    />
+  );
+
   if (loading) {
     return (
       <div className="flex h-dvh items-center justify-center bg-background p-4">
@@ -1149,7 +1271,40 @@ function App() {
     );
   }
 
-  if (backendFatalError) {
+  if (runnerStatusLoading && !runnerStatus) {
+    return (
+      <div className="flex h-dvh items-center justify-center bg-background p-4">
+        <Card className="w-full max-w-md border border-border/80 bg-card shadow-sm">
+          <CardContent className="pt-6">
+            <CardTitle>Checking runners</CardTitle>
+            <CardDescription className="mt-1">
+              Looking for installed runners before opening the workspace.
+            </CardDescription>
+          </CardContent>
+        </Card>
+      </div>
+    );
+  }
+
+  if (runnerStatus && availableRunners.length === 0) {
+    return (
+      <>
+        <RunnerManager
+          runners={runnerStatus.runners}
+          loading={runnerStatusLoading}
+          error={runnerManagerError ?? runnerStatusError}
+          blocking
+          onInstall={handleInstallRunner}
+          onAuthenticate={handleAuthenticateRunner}
+          onOpenGuide={handleOpenRunnerGuide}
+          onRefresh={handleRefreshRunners}
+        />
+        {runnerAuthDialog}
+      </>
+    );
+  }
+
+  if (backendFatalError && !runnerStatus) {
     return (
       <div className="flex h-dvh items-center justify-center bg-background p-4">
         <Card className="w-full max-w-2xl border border-border/80 bg-card shadow-sm">
@@ -1199,6 +1354,7 @@ function App() {
           pythonInterpreterError={pythonInterpreterError}
           onRefreshPythonInterpreter={refreshPythonInterpreter}
           onSavePythonInterpreter={handleSavePythonInterpreter}
+          onOpenRunnerManager={runnerStatus ? () => setShowRunnerManager(true) : undefined}
         />
 
         {allowWorkspaceSidebar ? (
@@ -1352,6 +1508,9 @@ function App() {
             onStepTargetChange={setWalkthroughFocusedTarget}
           />
         ) : null}
+
+        {runnerManagerDialog}
+        {runnerAuthDialog}
       </div>
     );
   }
@@ -1408,6 +1567,7 @@ function App() {
           pythonInterpreterError={pythonInterpreterError}
           onRefreshPythonInterpreter={refreshPythonInterpreter}
           onSavePythonInterpreter={handleSavePythonInterpreter}
+          onOpenRunnerManager={runnerStatus ? () => setShowRunnerManager(true) : undefined}
         />
 
         <div
@@ -1534,6 +1694,9 @@ function App() {
             onClose={() => setAnnotationLiveOutputOpen(false)}
           />
         ) : null}
+
+        {runnerManagerDialog}
+        {runnerAuthDialog}
       </div>
     </TooltipProvider>
   );

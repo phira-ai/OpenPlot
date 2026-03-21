@@ -8,7 +8,6 @@ import type {
   PlotModeState,
   PlotModeChatMessage,
   PlotModeExecutionMode,
-  RunnerAvailabilityState,
   Annotation,
   WsEvent,
   FixJob,
@@ -21,6 +20,7 @@ import type {
   PlotModePathSuggestionResponse,
   PythonInterpreterMode,
   PythonInterpreterState,
+  RunnerStatusState,
 } from "../types";
 import { API_BASE, fetchJSON } from "../api/client";
 import { asErrorMessage } from "../lib/errors";
@@ -351,6 +351,9 @@ export function useSessionState() {
   const [error, setError] = useState<string | null>(null);
   const [selectedRunner, setSelectedRunner] = useState<FixRunner>("opencode");
   const [availableRunners, setAvailableRunners] = useState<FixRunner[]>([]);
+  const [runnerStatus, setRunnerStatus] = useState<RunnerStatusState | null>(null);
+  const [runnerStatusLoading, setRunnerStatusLoading] = useState(true);
+  const [runnerStatusError, setRunnerStatusError] = useState<string | null>(null);
   const [backendFatalError, setBackendFatalError] = useState<string | null>(null);
   const [opencodeModels, setOpencodeModels] = useState<OpencodeModelOption[]>([]);
   const [defaultOpencodeModel, setDefaultOpencodeModel] = useState("");
@@ -366,6 +369,7 @@ export function useSessionState() {
   const [fixStepLogsByKey, setFixStepLogsByKey] = useState<Record<string, FixJobLogEvent[]>>({});
   const runnerModelsRequestIdRef = useRef(0);
   const availableRunnersRef = useRef<FixRunner[]>([]);
+  const runnerStatusRef = useRef<RunnerStatusState | null>(null);
   const activeWorkspaceIdRef = useRef<string | null>(null);
   const modeRef = useRef<AppMode>("plot");
   const plotModeRef = useRef<PlotModeState | null>(null);
@@ -479,31 +483,66 @@ export function useSessionState() {
     availableRunnersRef.current = availableRunners;
   }, [availableRunners]);
 
+  useEffect(() => {
+    runnerStatusRef.current = runnerStatus;
+  }, [runnerStatus]);
+
   const refreshRunnerAvailability = useCallback(async () => {
+    setRunnerStatusLoading(true);
     try {
-      const payload = await fetchJSON<RunnerAvailabilityState>("/api/runners");
+      const payload = await fetchJSON<RunnerStatusState>("/api/runners/status");
       const available = Array.isArray(payload.available_runners)
         ? payload.available_runners.filter(
             (runner): runner is FixRunner =>
               runner === "opencode" || runner === "codex" || runner === "claude",
           )
         : [];
+      setRunnerStatus(payload);
       setAvailableRunners(available);
+      setRunnerStatusError(null);
+      setBackendFatalError(null);
       if (available.length === 0) {
         setBackendFatalError(
           "At least one backend CLI must exist: codex, claude code, opencode.",
         );
         setOpencodeModelsLoading(false);
+      }
+    } catch (err: unknown) {
+      const message = asErrorMessage(err, "Failed to detect available backend CLIs");
+      setRunnerStatusError(message);
+      if (!runnerStatusRef.current) {
+        setRunnerStatus(null);
+        setAvailableRunners([]);
+        setBackendFatalError(message);
       } else {
         setBackendFatalError(null);
       }
-    } catch (err: unknown) {
-      setAvailableRunners([]);
-      setBackendFatalError(
-        asErrorMessage(err, "Failed to detect available backend CLIs"),
-      );
       setOpencodeModelsLoading(false);
+    } finally {
+      setRunnerStatusLoading(false);
     }
+  }, []);
+
+  const installRunner = useCallback(async (runner: FixRunner) => {
+    await fetchJSON<{ job: { id: string } }>("/api/runners/install", {
+      method: "POST",
+      body: JSON.stringify({ runner }),
+    });
+    await refreshRunnerAvailability();
+  }, [refreshRunnerAvailability]);
+
+  const launchRunnerAuth = useCallback(async (runner: FixRunner) => {
+    await fetchJSON<{ status: string }>("/api/runners/auth/launch", {
+      method: "POST",
+      body: JSON.stringify({ runner }),
+    });
+  }, []);
+
+  const openExternalUrl = useCallback(async (url: string) => {
+    await fetchJSON<{ status: string }>("/api/open-external-url", {
+      method: "POST",
+      body: JSON.stringify({ url }),
+    });
   }, []);
 
   const refreshRunnerModels = useCallback(async (runner: FixRunner) => {
@@ -614,6 +653,20 @@ export function useSessionState() {
     refreshPythonInterpreter,
     refreshRunnerAvailability,
   ]);
+
+  useEffect(() => {
+    if (!runnerStatus?.active_install_job_id) {
+      return;
+    }
+
+    const intervalId = window.setInterval(() => {
+      void refreshRunnerAvailability();
+    }, 2000);
+
+    return () => {
+      window.clearInterval(intervalId);
+    };
+  }, [refreshRunnerAvailability, runnerStatus?.active_install_job_id]);
 
   useEffect(() => {
     setOpencodeModels([]);
@@ -1537,6 +1590,9 @@ export function useSessionState() {
     selectedRunner,
     setSelectedRunner,
     availableRunners,
+    runnerStatus,
+    runnerStatusLoading,
+    runnerStatusError,
     backendFatalError,
     opencodeModels,
     defaultOpencodeModel,
@@ -1551,6 +1607,9 @@ export function useSessionState() {
     plotVersion,
     refresh,
     refreshRunnerAvailability,
+    installRunner,
+    launchRunnerAuth,
+    openExternalUrl,
     refreshRunnerModels,
     refreshFixJob,
     refreshPythonInterpreter,
