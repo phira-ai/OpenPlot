@@ -66,7 +66,7 @@
 
         frontendDist = pkgs.buildNpmPackage {
           pname = "openplot-frontend";
-          version = "1.0.0";
+          version = "1.1.0";
           src = ./frontend;
           npmDepsHash = "sha256-cV/TWZrmoF/o9Y50+SKXnl4nE4IsNUPXIUzTQyPCVW0=";
           npmBuildScript = "build";
@@ -89,7 +89,7 @@
 
         openplot = pkgs.stdenvNoCC.mkDerivation {
           pname = "openplot";
-          version = "1.0.0";
+          version = "1.1.0";
           src = lib.cleanSource ./.;
           nativeBuildInputs = [ pkgs.makeWrapper ];
 
@@ -115,7 +115,7 @@
 
         openplotDesktop = pkgs.stdenvNoCC.mkDerivation {
           pname = "openplot-desktop";
-          version = "1.0.0";
+          version = "1.1.0";
           src = lib.cleanSource ./.;
           nativeBuildInputs = [ pkgs.makeWrapper ] ++ lib.optionals pkgs.stdenv.hostPlatform.isLinux [ pkgs.qt6.wrapQtAppsHook ];
           buildInputs = lib.optionals pkgs.stdenv.hostPlatform.isLinux [ pkgs.qt6.qtbase pkgs.qt6.qtwayland pkgs.qt6.qtwebengine ];
