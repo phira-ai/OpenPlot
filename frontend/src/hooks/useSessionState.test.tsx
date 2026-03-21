@@ -4,7 +4,13 @@ import { act } from "react";
 import { createRoot } from "react-dom/client";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 
-import type { BootstrapState, PlotModeState, PythonInterpreterState, PlotSession } from "../types";
+import type {
+  BootstrapState,
+  PlotModeState,
+  PythonInterpreterState,
+  PlotSession,
+  RunnerStatusState,
+} from "../types";
 
 vi.mock("../api/client", () => ({
   API_BASE: "",
@@ -174,6 +180,61 @@ const pythonInterpreterState: PythonInterpreterState = {
   candidates: [],
 };
 
+function createRunnerStatusState(
+  overrides: Partial<RunnerStatusState> = {},
+): RunnerStatusState {
+  return {
+    available_runners: [],
+    supported_runners: ["opencode", "codex", "claude"],
+    claude_code_available: false,
+    host_platform: "darwin",
+    host_arch: "arm64",
+    active_install_job_id: null,
+    runners: [
+      {
+        runner: "opencode",
+        status: "available_to_install",
+        status_label: "Available to install",
+        primary_action: "install",
+        primary_action_label: "Install",
+        guide_url: "https://opencode.ai/docs",
+        installed: false,
+        executable_path: null,
+        install_job: null,
+        auth_command: null,
+        auth_instructions: null,
+      },
+      {
+        runner: "codex",
+        status: "available_to_install",
+        status_label: "Available to install",
+        primary_action: "install",
+        primary_action_label: "Install",
+        guide_url: "https://developers.openai.com/codex",
+        installed: false,
+        executable_path: null,
+        install_job: null,
+        auth_command: null,
+        auth_instructions: null,
+      },
+      {
+        runner: "claude",
+        status: "available_to_install",
+        status_label: "Available to install",
+        primary_action: "install",
+        primary_action_label: "Install",
+        guide_url: "https://docs.anthropic.com/en/docs/agents-and-tools/claude-code/overview",
+        installed: false,
+        executable_path: null,
+        install_job: null,
+        auth_command: null,
+        auth_instructions: null,
+      },
+    ],
+    ...overrides,
+  };
+}
+
 async function flushPromises() {
   await Promise.resolve();
   await Promise.resolve();
@@ -204,6 +265,110 @@ describe("useSessionState", () => {
     vi.unstubAllGlobals();
   });
 
+  it("loads rich runner status and keeps onboarding state when no runners are available", async () => {
+    const runnerStatus = createRunnerStatusState();
+
+    fetchJSONMock.mockImplementation(async (url) => {
+      if (url === "/api/bootstrap") {
+        return createPlotBootstrap("plot-initial");
+      }
+      if (url === "/api/runners/status") {
+        return runnerStatus;
+      }
+      if (url === "/api/preferences") {
+        return {};
+      }
+      if (url === "/api/python/interpreter") {
+        return pythonInterpreterState;
+      }
+      throw new Error(`Unhandled fetchJSON call: ${url}`);
+    });
+
+    function Harness() {
+      latestState = useSessionState();
+      return null;
+    }
+
+    await act(async () => {
+      root.render(<Harness />);
+      await flushPromises();
+    });
+
+    expect(fetchJSONMock).toHaveBeenCalledWith("/api/runners/status");
+    expect(latestState?.runnerStatus).toEqual(runnerStatus);
+    expect(latestState?.availableRunners).toEqual([]);
+    expect(latestState?.runnerStatusLoading).toBe(false);
+    expect(latestState?.runnerStatusError).toBeNull();
+    expect(latestState?.backendFatalError).toBe(
+      "At least one backend CLI must exist: codex, claude code, opencode.",
+    );
+  });
+
+  it("exposes runner install, auth launch, and guide actions", async () => {
+    const runnerStatus = createRunnerStatusState({ available_runners: ["opencode"] });
+
+    fetchJSONMock.mockImplementation(async (url, init) => {
+      if (url === "/api/bootstrap") {
+        return createPlotBootstrap("plot-initial");
+      }
+      if (url === "/api/runners/status") {
+        return runnerStatus;
+      }
+      if (url === "/api/preferences") {
+        return {};
+      }
+      if (url === "/api/python/interpreter") {
+        return pythonInterpreterState;
+      }
+      if (url === "/api/runners/install") {
+        expect(init).toMatchObject({ method: "POST" });
+        expect(init?.body).toBe(JSON.stringify({ runner: "codex" }));
+        return { job: { id: "job-1" } };
+      }
+      if (url === "/api/runners/auth/launch") {
+        expect(init).toMatchObject({ method: "POST" });
+        expect(init?.body).toBe(JSON.stringify({ runner: "claude" }));
+        return { status: "ok" };
+      }
+      if (url === "/api/open-external-url") {
+        expect(init).toMatchObject({ method: "POST" });
+        expect(init?.body).toBe(JSON.stringify({ url: "https://example.com/guide" }));
+        return { status: "ok" };
+      }
+      throw new Error(`Unhandled fetchJSON call: ${url}`);
+    });
+
+    function Harness() {
+      latestState = useSessionState();
+      return null;
+    }
+
+    await act(async () => {
+      root.render(<Harness />);
+      await flushPromises();
+    });
+
+    await act(async () => {
+      await latestState?.installRunner?.("codex");
+      await latestState?.launchRunnerAuth?.("claude");
+      await latestState?.openExternalUrl?.("https://example.com/guide");
+      await flushPromises();
+    });
+
+    expect(fetchJSONMock).toHaveBeenCalledWith(
+      "/api/runners/install",
+      expect.objectContaining({ method: "POST" }),
+    );
+    expect(fetchJSONMock).toHaveBeenCalledWith(
+      "/api/runners/auth/launch",
+      expect.objectContaining({ method: "POST" }),
+    );
+    expect(fetchJSONMock).toHaveBeenCalledWith(
+      "/api/open-external-url",
+      expect.objectContaining({ method: "POST" }),
+    );
+  });
+
   it("ignores a late plot activation response after a newer workspace switch", async () => {
     const activationResolvers = new Map<string, (payload: BootstrapState) => void>();
 
@@ -211,12 +376,8 @@ describe("useSessionState", () => {
       if (url === "/api/bootstrap") {
         return createPlotBootstrap("plot-initial");
       }
-      if (url === "/api/runners") {
-        return {
-          available_runners: [],
-          supported_runners: [],
-          claude_code_available: false,
-        };
+      if (url === "/api/runners/status") {
+        return createRunnerStatusState();
       }
       if (url === "/api/preferences") {
         return {};
@@ -274,12 +435,8 @@ describe("useSessionState", () => {
       if (url === "/api/bootstrap") {
         return createPlotBootstrap("plot-a");
       }
-      if (url === "/api/runners") {
-        return {
-          available_runners: [],
-          supported_runners: [],
-          claude_code_available: false,
-        };
+      if (url === "/api/runners/status") {
+        return createRunnerStatusState();
       }
       if (url === "/api/preferences") {
         return {};
@@ -344,12 +501,8 @@ describe("useSessionState", () => {
           resolveBootstrapRefresh = resolve;
         });
       }
-      if (url === "/api/runners") {
-        return {
-          available_runners: [],
-          supported_runners: [],
-          claude_code_available: false,
-        };
+      if (url === "/api/runners/status") {
+        return createRunnerStatusState();
       }
       if (url === "/api/preferences") {
         return {};
@@ -417,12 +570,8 @@ describe("useSessionState", () => {
           rejectBootstrapRefresh = reject as (error: Error) => void;
         });
       }
-      if (url === "/api/runners") {
-        return {
-          available_runners: [],
-          supported_runners: [],
-          claude_code_available: false,
-        };
+      if (url === "/api/runners/status") {
+        return createRunnerStatusState();
       }
       if (url === "/api/preferences") {
         return {};
