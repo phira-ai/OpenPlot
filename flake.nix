@@ -7,7 +7,11 @@
   };
 
   outputs =
-    { self, nixpkgs, flake-utils }:
+    {
+      self,
+      nixpkgs,
+      flake-utils,
+    }:
     let
       systems = [
         "x86_64-linux"
@@ -68,7 +72,7 @@
           pname = "openplot-frontend";
           version = "1.1.0";
           src = ./frontend;
-          npmDepsHash = "sha256-cV/TWZrmoF/o9Y50+SKXnl4nE4IsNUPXIUzTQyPCVW0=";
+          npmDepsHash = "sha256-tx8lsrlYHVpLYugjiDVTO+fWwTC1e6DAEzBrtQi7O0I=";
           npmBuildScript = "build";
 
           installPhase = ''
@@ -79,13 +83,9 @@
           '';
         };
 
-        runtimePython = pkgs.python312.withPackages (
-          ps: basePythonPackages ps
-        );
+        runtimePython = pkgs.python312.withPackages (ps: basePythonPackages ps);
 
-        desktopPython = pkgs.python312.withPackages (
-          ps: desktopPythonPackages ps
-        );
+        desktopPython = pkgs.python312.withPackages (ps: desktopPythonPackages ps);
 
         openplot = pkgs.stdenvNoCC.mkDerivation {
           pname = "openplot";
@@ -117,8 +117,15 @@
           pname = "openplot-desktop";
           version = "1.1.0";
           src = lib.cleanSource ./.;
-          nativeBuildInputs = [ pkgs.makeWrapper ] ++ lib.optionals pkgs.stdenv.hostPlatform.isLinux [ pkgs.qt6.wrapQtAppsHook ];
-          buildInputs = lib.optionals pkgs.stdenv.hostPlatform.isLinux [ pkgs.qt6.qtbase pkgs.qt6.qtwayland pkgs.qt6.qtwebengine ];
+          nativeBuildInputs = [
+            pkgs.makeWrapper
+          ]
+          ++ lib.optionals pkgs.stdenv.hostPlatform.isLinux [ pkgs.qt6.wrapQtAppsHook ];
+          buildInputs = lib.optionals pkgs.stdenv.hostPlatform.isLinux [
+            pkgs.qt6.qtbase
+            pkgs.qt6.qtwayland
+            pkgs.qt6.qtwebengine
+          ];
 
           installPhase = ''
             runHook preInstall
