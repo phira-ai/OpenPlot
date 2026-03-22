@@ -85,12 +85,14 @@ from .models import (
     PlotModeDataProfile,
     PlotModeExecutionMode,
     PlotModeFile,
+    PlotModeInputBundle,
     PlotModeMessageKind,
     PlotModeMessageMetadata,
     PlotModePhase,
     PlotModeQuestionItem,
     PlotModeQuestionOption,
     PlotModeQuestionSet,
+    PlotModeResolvedDataSource,
     PlotModeSheetBounds,
     PlotModeSheetCandidate,
     PlotModeSheetPreview,
@@ -3281,6 +3283,228 @@ def _profile_selected_data_files(
     return profiles, activity_items, selector
 
 
+def _plot_mode_file_kind(file: PlotModeFile) -> str:
+    suffix = Path(file.stored_path).suffix.lower()
+    if suffix == ".csv":
+        return "csv"
+    if suffix == ".tsv":
+        return "tsv"
+    if suffix in {".xls", ".xlsx"}:
+        return "excel"
+    if suffix in {".json", ".jsonl"}:
+        return "json"
+    if suffix == ".txt":
+        return "txt"
+    return suffix.lstrip(".") or "file"
+
+
+def _build_plot_mode_input_bundle(
+    files: list[PlotModeFile],
+) -> PlotModeInputBundle | None:
+    if not files:
+        return None
+
+    file_kinds: list[str] = []
+    for file in files:
+        kind = _plot_mode_file_kind(file)
+        if kind not in file_kinds:
+            file_kinds.append(kind)
+
+    file_count = len(files)
+    kind_label = "/".join(file_kinds[:3]) if file_kinds else "file"
+    label = f"{file_count} selected file{'s' if file_count != 1 else ''}"
+    summary = f"{file_count} {kind_label} file{'s' if file_count != 1 else ''} selected for this workspace."
+    return PlotModeInputBundle(
+        label=label,
+        summary=summary,
+        file_ids=[file.id for file in files],
+        file_paths=[str(Path(file.stored_path).resolve()) for file in files],
+        file_count=file_count,
+        file_kinds=file_kinds,
+    )
+
+
+def _resolved_source_kind_for_profile(profile: PlotModeDataProfile) -> str:
+    if profile.source_kind == "file":
+        return "unstructured_file"
+    if len(_tabular_regions_for_profile(profile)) > 1:
+        return "multi_region_excel_source"
+    if profile.source_kind == "excel" or profile.table_name is not None:
+        return "excel_region"
+    return "single_file"
+
+
+def _build_resolved_source_for_profile(
+    profile: PlotModeDataProfile,
+) -> PlotModeResolvedDataSource:
+    return PlotModeResolvedDataSource(
+        kind=cast(
+            Literal[
+                "single_file",
+                "multi_file_collection",
+                "excel_region",
+                "multi_region_excel_source",
+                "unstructured_file",
+                "mixed_bundle",
+            ],
+            _resolved_source_kind_for_profile(profile),
+        ),
+        label=profile.source_label,
+        summary=profile.summary,
+        file_ids=[profile.source_file_id] if profile.source_file_id else [],
+        file_paths=[profile.file_path],
+        file_count=1,
+        profile_ids=[profile.id],
+        columns=profile.columns,
+        integrity_notes=profile.integrity_notes,
+    )
+
+
+def _profile_column_signature(profile: PlotModeDataProfile) -> tuple[str, ...]:
+    return tuple(
+        sorted({column.strip().lower() for column in profile.columns if column.strip()})
+    )
+
+
+def _dedupe_preserving_order(values: list[str]) -> list[str]:
+    result: list[str] = []
+    for value in values:
+        if value and value not in result:
+            result.append(value)
+    return result
+
+
+def _build_multi_file_collection_source(
+    files: list[PlotModeFile],
+    profiles: list[PlotModeDataProfile],
+) -> PlotModeResolvedDataSource:
+    columns = profiles[0].columns[:] if profiles else []
+    integrity_notes = _dedupe_preserving_order(
+        [note for profile in profiles for note in profile.integrity_notes]
+    )
+    label = f"{len(files)} CSV files"
+    summary = f"Treat these {len(files)} CSV files as one multi-file dataset."
+    if columns:
+        summary += " Shared columns: " + ", ".join(columns[:6]) + "."
+    return PlotModeResolvedDataSource(
+        kind="multi_file_collection",
+        label=label,
+        summary=summary,
+        file_ids=[file.id for file in files],
+        file_paths=[str(Path(file.stored_path).resolve()) for file in files],
+        file_count=len(files),
+        profile_ids=[profile.id for profile in profiles],
+        columns=columns,
+        integrity_notes=integrity_notes,
+    )
+
+
+def _build_mixed_bundle_source(
+    files: list[PlotModeFile],
+    profiles: list[PlotModeDataProfile],
+) -> PlotModeResolvedDataSource:
+    kinds = _dedupe_preserving_order([_plot_mode_file_kind(file) for file in files])
+    label = f"{len(files)} selected files"
+    summary = f"Treat these {len(files)} files as one input bundle until the plotting relationship is clarified."
+    if kinds:
+        summary += " Source kinds: " + ", ".join(kinds[:6]) + "."
+    return PlotModeResolvedDataSource(
+        kind="mixed_bundle",
+        label=label,
+        summary=summary,
+        file_ids=[file.id for file in files],
+        file_paths=[str(Path(file.stored_path).resolve()) for file in files],
+        file_count=len(files),
+        profile_ids=[profile.id for profile in profiles],
+        columns=_dedupe_preserving_order(
+            [column for profile in profiles for column in profile.columns]
+        )[:16],
+        integrity_notes=_dedupe_preserving_order(
+            [note for profile in profiles for note in profile.integrity_notes]
+        ),
+    )
+
+
+def _build_plot_mode_resolved_sources(
+    files: list[PlotModeFile],
+    profiles: list[PlotModeDataProfile],
+    selector: PlotModeTabularSelector | None,
+) -> tuple[list[PlotModeResolvedDataSource], list[str]]:
+    if len(files) > 1 and selector is None:
+        signatures = {_profile_column_signature(profile) for profile in profiles}
+        if (
+            len(profiles) == len(files)
+            and profiles
+            and all(profile.source_kind == "csv" for profile in profiles)
+            and len(signatures) == 1
+            and all(signature for signature in signatures)
+        ):
+            source = _build_multi_file_collection_source(files, profiles)
+            return [source], [source.id]
+
+        source = _build_mixed_bundle_source(files, profiles)
+        return [source], [source.id]
+
+    return [_build_resolved_source_for_profile(profile) for profile in profiles], []
+
+
+def _active_resolved_sources(state: PlotModeState) -> list[PlotModeResolvedDataSource]:
+    if not state.active_resolved_source_ids:
+        return []
+    active_ids = set(state.active_resolved_source_ids)
+    return [source for source in state.resolved_sources if source.id in active_ids]
+
+
+def _set_active_resolved_source_for_profile(
+    state: PlotModeState,
+    profile: PlotModeDataProfile | None,
+) -> None:
+    if profile is None:
+        state.active_resolved_source_ids = []
+        return
+    for source in state.resolved_sources:
+        if profile.id in source.profile_ids:
+            state.active_resolved_source_ids = [source.id]
+            return
+    state.active_resolved_source_ids = []
+
+
+def _clear_selected_plot_mode_source_context(state: PlotModeState) -> None:
+    state.selected_data_profile_id = None
+    state.active_resolved_source_ids = []
+
+
+def _append_active_resolved_source_context(
+    lines: list[str],
+    state: PlotModeState,
+    *,
+    heading: str,
+) -> None:
+    sources = _active_resolved_sources(state)
+    if not sources:
+        return
+
+    lines.extend(["", heading])
+    for source in sources[:4]:
+        lines.append(f"- Label: {source.label}")
+        lines.append(f"- Kind: {source.kind}")
+        if source.summary:
+            lines.append(f"- Summary: {source.summary}")
+        if source.columns:
+            lines.append("- Columns: " + ", ".join(source.columns[:16]))
+        if source.file_paths:
+            lines.append("- Files:")
+            for path in source.file_paths[:_plot_mode_prompt_files_limit]:
+                lines.append(f"  - {path}")
+            if len(source.file_paths) > _plot_mode_prompt_files_limit:
+                remaining = len(source.file_paths) - _plot_mode_prompt_files_limit
+                lines.append(f"  - ... and {remaining} more files")
+        if source.integrity_notes:
+            lines.append("- Integrity notes:")
+            for note in source.integrity_notes[:8]:
+                lines.append(f"  - {note}")
+
+
 def _selected_data_profile(state: PlotModeState) -> PlotModeDataProfile | None:
     if state.selected_data_profile_id:
         for profile in state.data_profiles:
@@ -3416,6 +3640,7 @@ def _present_profile_for_confirmation(
     if not _profile_supports_preview_confirmation(profile):
         state.pending_question_set = None
         state.selected_data_profile_id = profile.id
+        _set_active_resolved_source_for_profile(state, profile)
         state.phase = PlotModePhase.awaiting_prompt
         _append_plot_mode_message(
             state,
@@ -3546,7 +3771,12 @@ async def _apply_tabular_range_proposal(
 def _populate_plot_mode_data_messages(state: PlotModeState) -> None:
     profiles, activity_items, selector = _profile_selected_data_files(state.files)
     state.messages = []
+    state.input_bundle = _build_plot_mode_input_bundle(state.files)
     state.data_profiles = profiles
+    (
+        state.resolved_sources,
+        state.active_resolved_source_ids,
+    ) = _build_plot_mode_resolved_sources(state.files, profiles, selector)
     state.selected_data_profile_id = None
     state.tabular_selector = selector
     state.pending_question_set = None
@@ -3566,6 +3796,32 @@ def _populate_plot_mode_data_messages(state: PlotModeState) -> None:
         return
 
     if not profiles:
+        if state.resolved_sources:
+            state.phase = PlotModePhase.awaiting_prompt
+            for source in state.resolved_sources:
+                _append_plot_mode_activity(
+                    state,
+                    title="Source bundle ready",
+                    items=[source.summary],
+                )
+            return
+        state.phase = PlotModePhase.awaiting_prompt
+        return
+
+    if len(state.files) > 1 and state.active_resolved_source_ids:
+        for profile in profiles:
+            _append_profile_preview_card(state, profile)
+        for source in _active_resolved_sources(state):
+            activity_items = [source.summary]
+            if source.columns:
+                activity_items.append(
+                    "Shared columns: " + ", ".join(source.columns[:8])
+                )
+            _append_plot_mode_activity(
+                state,
+                title="Source bundle ready",
+                items=activity_items,
+            )
         state.phase = PlotModePhase.awaiting_prompt
         return
 
@@ -3636,6 +3892,12 @@ def _build_plot_mode_review_prompt(
             lines.append(
                 f"Confirmed region: {_format_sheet_region_label(region.sheet_name, bounds)}"
             )
+    else:
+        _append_active_resolved_source_context(
+            lines,
+            state,
+            heading="Confirmed datasource(s):",
+        )
     if state.current_plot:
         lines.append(f"Latest rendered preview path: {state.current_plot}")
         lines.append(
@@ -3794,6 +4056,12 @@ def _build_plot_mode_prompt(state: PlotModeState, user_message: str) -> str:
             lines.append("- Integrity notes:")
             for note in selected_profile.integrity_notes[:8]:
                 lines.append(f"  - {note}")
+    else:
+        _append_active_resolved_source_context(
+            lines,
+            state,
+            heading="Confirmed datasource(s):",
+        )
 
     if state.current_script:
         lines.extend(
@@ -3873,6 +4141,12 @@ def _build_plot_mode_planning_prompt(state: PlotModeState, user_message: str) ->
             lines.append("- Preview integrity notes:")
             for note in profile.integrity_notes[:8]:
                 lines.append(f"  - {note}")
+    else:
+        _append_active_resolved_source_context(
+            lines,
+            state,
+            heading="Confirmed datasource(s):",
+        )
 
     if state.latest_plan_summary:
         lines.extend(
@@ -5540,7 +5814,9 @@ async def _run_plot_mode_generation(
         capture_dir = _plot_mode_captures_dir(state) / _new_id()
         capture_dir.mkdir(parents=True, exist_ok=True)
         set_workspace_dir(Path(state.workspace_dir))
-        protected_paths = [profile.file_path for profile in state.data_profiles]
+        protected_paths = [
+            str(Path(file.stored_path).resolve()) for file in state.files
+        ]
         execution_result = await asyncio.to_thread(
             execute_script,
             script_path,
@@ -5908,6 +6184,7 @@ async def _start_plot_mode_planning_for_profile(
     profile: PlotModeDataProfile,
 ) -> tuple[bool, str | None]:
     state.selected_data_profile_id = profile.id
+    _set_active_resolved_source_for_profile(state, profile)
     runner = _resolve_available_runner(
         _normalize_fix_runner(state.selected_runner, default=_default_fix_runner)
     )
@@ -9267,7 +9544,7 @@ def _register_routes(app: FastAPI) -> None:
                 )
 
             state.pending_question_set = None
-            state.selected_data_profile_id = None
+            _clear_selected_plot_mode_source_context(state)
             state.latest_plan_summary = ""
             state.latest_plan_outline = []
             state.latest_plan_plot_type = ""
@@ -9362,7 +9639,7 @@ def _register_routes(app: FastAPI) -> None:
                     }
                 return {"status": "ok", "plot_mode": state.model_dump(mode="json")}
 
-            state.selected_data_profile_id = None
+            _clear_selected_plot_mode_source_context(state)
             if decision == "adjust_selection":
                 if state.tabular_selector is None:
                     raise HTTPException(
@@ -9467,7 +9744,7 @@ def _register_routes(app: FastAPI) -> None:
                     }
                 return {"status": "ok", "plot_mode": state.model_dump(mode="json")}
 
-            state.selected_data_profile_id = None
+            _clear_selected_plot_mode_source_context(state)
             if decision == "adjust_selection":
                 if state.tabular_selector is None:
                     raise HTTPException(
@@ -9718,7 +9995,11 @@ def _register_routes(app: FastAPI) -> None:
                 status_code=409,
                 detail="Mark the relevant cells in the tabular selector before continuing.",
             )
-        if _selected_data_profile(state) is None and state.data_profiles:
+        if (
+            _selected_data_profile(state) is None
+            and state.data_profiles
+            and not state.active_resolved_source_ids
+        ):
             raise HTTPException(
                 status_code=409,
                 detail="Choose the data source to plot before drafting a figure.",

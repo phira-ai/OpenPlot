@@ -3,6 +3,7 @@ from __future__ import annotations
 import asyncio
 import json
 from pathlib import Path
+from typing import cast
 
 import pytest
 from fastapi.testclient import TestClient
@@ -499,6 +500,134 @@ def test_plot_mode_rejects_adding_more_files_after_initial_selection(
     )
 
 
+def test_plot_mode_multiple_csvs_resolve_to_a_combined_bundle_source(
+    monkeypatch,
+    tmp_path: Path,
+) -> None:
+    monkeypatch.setenv("XDG_STATE_HOME", str(tmp_path / "state"))
+    workspace = tmp_path / "workspace"
+    workspace.mkdir(parents=True, exist_ok=True)
+    paths = [
+        workspace / "first.csv",
+        workspace / "second.csv",
+        workspace / "third.csv",
+        workspace / "fourth.csv",
+    ]
+    for index, path in enumerate(paths, start=1):
+        path.write_text(f"x,y\n{index},{index + 1}\n")
+
+    server.init_plot_mode_session(workspace_dir=workspace)
+
+    with TestClient(server.create_app()) as client:
+        response = client.post(
+            "/api/plot-mode/select-paths",
+            json={"selection_type": "data", "paths": [str(path) for path in paths]},
+        )
+
+    assert response.status_code == 200
+    plot_mode = response.json()["plot_mode"]
+    assert plot_mode["phase"] == "awaiting_prompt"
+    assert plot_mode["pending_question_set"] is None
+    assert plot_mode["selected_data_profile_id"] is None
+    table_previews = [
+        message
+        for message in plot_mode["messages"]
+        if (message.get("metadata") or {}).get("kind") == "table_preview"
+    ]
+    assert len(table_previews) == 4
+    assert plot_mode["input_bundle"] is not None
+    assert plot_mode["input_bundle"]["file_count"] == 4
+    assert len(plot_mode["resolved_sources"]) == 1
+    resolved_source = plot_mode["resolved_sources"][0]
+    assert resolved_source["kind"] == "multi_file_collection"
+    assert resolved_source["file_count"] == 4
+    assert resolved_source["file_ids"] == plot_mode["input_bundle"]["file_ids"]
+    assert plot_mode["active_resolved_source_ids"] == [resolved_source["id"]]
+
+
+def test_plot_mode_multi_csv_bundle_tolerates_reordered_headers(
+    monkeypatch,
+    tmp_path: Path,
+) -> None:
+    monkeypatch.setenv("XDG_STATE_HOME", str(tmp_path / "state"))
+    workspace = tmp_path / "workspace"
+    workspace.mkdir(parents=True, exist_ok=True)
+    first = workspace / "first.csv"
+    second = workspace / "second.csv"
+    first.write_text("x,y\n1,2\n")
+    second.write_text("y,x\n3,2\n")
+
+    server.init_plot_mode_session(workspace_dir=workspace)
+
+    with TestClient(server.create_app()) as client:
+        response = client.post(
+            "/api/plot-mode/select-paths",
+            json={"selection_type": "data", "paths": [str(first), str(second)]},
+        )
+
+    assert response.status_code == 200
+    plot_mode = response.json()["plot_mode"]
+    assert plot_mode["phase"] == "awaiting_prompt"
+    assert len(plot_mode["resolved_sources"]) == 1
+    assert plot_mode["resolved_sources"][0]["kind"] == "multi_file_collection"
+
+
+def test_plot_mode_chat_accepts_a_combined_multi_file_bundle(
+    monkeypatch,
+    tmp_path: Path,
+) -> None:
+    monkeypatch.setenv("XDG_STATE_HOME", str(tmp_path / "state"))
+    workspace = tmp_path / "workspace"
+    workspace.mkdir(parents=True, exist_ok=True)
+    first = workspace / "first.csv"
+    second = workspace / "second.csv"
+    first.write_text("x,y\n1,2\n")
+    second.write_text("x,y\n2,3\n")
+
+    seen: dict[str, object] = {}
+
+    async def _fake_planning(
+        *,
+        state,
+        runner,
+        user_message,
+        model,
+        variant,
+    ):
+        _ = (runner, model, variant)
+        seen["message"] = user_message
+        seen["selected_data_profile_id"] = state.selected_data_profile_id
+        seen["active_resolved_source_ids"] = list(state.active_resolved_source_ids)
+        return server.PlotModePlanResult(
+            assistant_text="I inspected the multi-file dataset and prepared a plan.",
+            summary="I can compare the two CSV files as separate series.",
+            plot_type="line chart",
+            plan_outline=["Compare the files as separate lines on one chart."],
+            data_actions=["Inspect both CSV files and align their shared columns."],
+            ready_to_plot=False,
+        )
+
+    monkeypatch.setattr(server, "_run_plot_mode_planning", _fake_planning)
+    server.init_plot_mode_session(workspace_dir=workspace)
+
+    with TestClient(server.create_app()) as client:
+        select_response = client.post(
+            "/api/plot-mode/select-paths",
+            json={"selection_type": "data", "paths": [str(first), str(second)]},
+        )
+        assert select_response.status_code == 200
+
+        chat_response = client.post(
+            "/api/plot-mode/chat",
+            json={"message": "Compare both files as two lines."},
+        )
+
+    assert chat_response.status_code == 200
+    assert seen["message"] == "Compare both files as two lines."
+    assert seen["selected_data_profile_id"] is None
+    assert len(cast(list[str], seen["active_resolved_source_ids"])) == 1
+
+
 def test_plot_mode_unsupported_preview_file_skips_data_confirmation(
     monkeypatch,
     tmp_path: Path,
@@ -532,7 +661,7 @@ def test_plot_mode_unsupported_preview_file_skips_data_confirmation(
     assert plot_mode["selected_data_profile_id"] == profile["id"]
 
 
-def test_plot_mode_selecting_unsupported_source_skips_data_confirmation(
+def test_plot_mode_mixed_file_selection_resolves_to_a_bundle_source(
     monkeypatch,
     tmp_path: Path,
 ) -> None:
@@ -556,35 +685,14 @@ def test_plot_mode_selecting_unsupported_source_skips_data_confirmation(
         )
         assert select_response.status_code == 200
         plot_mode = select_response.json()["plot_mode"]
-        assert plot_mode["phase"] == "awaiting_data_choice"
-        question_set = plot_mode["pending_question_set"]
-        assert question_set is not None
-        assert question_set["purpose"] == "select_data_source"
-
-        unsupported_profile = next(
-            profile
-            for profile in plot_mode["data_profiles"]
-            if profile["source_kind"] == "file"
-        )
-
-        answer_response = client.post(
-            "/api/plot-mode/answer",
-            json={
-                "question_set_id": question_set["id"],
-                "answers": [
-                    {
-                        "question_id": question_set["questions"][0]["id"],
-                        "option_ids": [unsupported_profile["id"]],
-                    }
-                ],
-            },
-        )
-
-    assert answer_response.status_code == 200
-    payload = answer_response.json()["plot_mode"]
-    assert payload["phase"] == "awaiting_prompt"
-    assert payload["pending_question_set"] is None
-    assert payload["selected_data_profile_id"] == unsupported_profile["id"]
+        assert plot_mode["phase"] == "awaiting_prompt"
+        assert plot_mode["pending_question_set"] is None
+        assert plot_mode["selected_data_profile_id"] is None
+        assert len(plot_mode["resolved_sources"]) == 1
+        resolved_source = plot_mode["resolved_sources"][0]
+        assert resolved_source["kind"] == "mixed_bundle"
+        assert resolved_source["file_count"] == 2
+        assert plot_mode["active_resolved_source_ids"] == [resolved_source["id"]]
 
 
 def test_plot_mode_dataset_chat_and_finalize(
@@ -958,7 +1066,7 @@ def test_plot_mode_settings_toggle_updates_execution_mode(
     assert response.json()["plot_mode"]["execution_mode"] == "autonomous"
 
 
-def test_plot_mode_answer_selects_profile_and_advances_prompt_phase(
+def test_plot_mode_multiple_csvs_skip_the_source_selection_question(
     monkeypatch,
     tmp_path: Path,
 ) -> None:
@@ -978,32 +1086,13 @@ def test_plot_mode_answer_selects_profile_and_advances_prompt_phase(
             json={"selection_type": "data", "paths": [str(first), str(second)]},
         )
         assert select_response.status_code == 200
-        plot_mode = select_response.json()["plot_mode"]
-        assert plot_mode["phase"] == "awaiting_data_choice"
-        question_id = plot_mode["pending_question_set"]["id"]
-        selected_profile_id = plot_mode["data_profiles"][0]["id"]
 
-        answer_response = client.post(
-            "/api/plot-mode/answer",
-            json={
-                "question_set_id": question_id,
-                "answers": [
-                    {
-                        "question_id": plot_mode["pending_question_set"]["questions"][
-                            0
-                        ]["id"],
-                        "option_ids": [selected_profile_id],
-                    }
-                ],
-            },
-        )
-
-    assert answer_response.status_code == 200
-    payload = answer_response.json()["plot_mode"]
-    assert payload["phase"] == "awaiting_data_choice"
+    payload = select_response.json()["plot_mode"]
+    assert payload["phase"] == "awaiting_prompt"
+    assert payload["pending_question_set"] is None
     assert payload["selected_data_profile_id"] is None
-    assert payload["pending_question_set"] is not None
-    assert payload["pending_question_set"]["purpose"] == "confirm_data_preview"
+    assert len(payload["resolved_sources"]) == 1
+    assert payload["resolved_sources"][0]["kind"] == "multi_file_collection"
 
 
 def test_plot_mode_preview_confirmation_advances_to_prompt_phase(

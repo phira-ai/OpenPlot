@@ -14,6 +14,7 @@ function createPlotModeState(): PlotModeState {
     workspace_name: "Workspace A",
     workspace_dir: "/tmp/workspace-a",
     files: [],
+    input_bundle: null,
     messages: [
       {
         id: "assistant-1",
@@ -24,6 +25,8 @@ function createPlotModeState(): PlotModeState {
       },
     ],
     data_profiles: [],
+    resolved_sources: [],
+    active_resolved_source_ids: [],
     selected_data_profile_id: null,
     tabular_selector: null,
     pending_question_set: null,

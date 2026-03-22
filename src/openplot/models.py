@@ -244,6 +244,37 @@ class PlotModeQuestionSet(BaseModel):
     questions: list[PlotModeQuestionItem] = Field(default_factory=list)
 
 
+class PlotModeInputBundle(BaseModel):
+    id: str = Field(default_factory=_new_id)
+    label: str = ""
+    summary: str = ""
+    selection_kind: str = "data"
+    file_ids: list[str] = Field(default_factory=list)
+    file_paths: list[str] = Field(default_factory=list)
+    file_count: int = 0
+    file_kinds: list[str] = Field(default_factory=list)
+
+
+class PlotModeResolvedDataSource(BaseModel):
+    id: str = Field(default_factory=_new_id)
+    kind: Literal[
+        "single_file",
+        "multi_file_collection",
+        "excel_region",
+        "multi_region_excel_source",
+        "unstructured_file",
+        "mixed_bundle",
+    ]
+    label: str
+    summary: str = ""
+    file_ids: list[str] = Field(default_factory=list)
+    file_paths: list[str] = Field(default_factory=list)
+    file_count: int = 0
+    profile_ids: list[str] = Field(default_factory=list)
+    columns: list[str] = Field(default_factory=list)
+    integrity_notes: list[str] = Field(default_factory=list)
+
+
 class PlotModeMessageMetadata(BaseModel):
     kind: PlotModeMessageKind = PlotModeMessageKind.markdown
     title: str | None = None
@@ -353,8 +384,11 @@ class PlotModeState(BaseModel):
     workspace_name: str = ""
     workspace_dir: str
     files: list[PlotModeFile] = Field(default_factory=list)
+    input_bundle: PlotModeInputBundle | None = None
     messages: list[PlotModeChatMessage] = Field(default_factory=list)
     data_profiles: list[PlotModeDataProfile] = Field(default_factory=list)
+    resolved_sources: list[PlotModeResolvedDataSource] = Field(default_factory=list)
+    active_resolved_source_ids: list[str] = Field(default_factory=list)
     selected_data_profile_id: str | None = None
     tabular_selector: PlotModeTabularSelector | None = None
     pending_question_set: PlotModeQuestionSet | None = None

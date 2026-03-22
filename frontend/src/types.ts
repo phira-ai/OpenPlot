@@ -149,6 +149,36 @@ export interface PlotModeQuestionSet {
   questions: PlotModeQuestionItem[];
 }
 
+export interface PlotModeInputBundle {
+  id: string;
+  label: string;
+  summary: string;
+  selection_kind: string;
+  file_ids: string[];
+  file_paths: string[];
+  file_count: number;
+  file_kinds: string[];
+}
+
+export interface PlotModeResolvedDataSource {
+  id: string;
+  kind:
+    | "single_file"
+    | "multi_file_collection"
+    | "excel_region"
+    | "multi_region_excel_source"
+    | "unstructured_file"
+    | "mixed_bundle";
+  label: string;
+  summary: string;
+  file_ids: string[];
+  file_paths: string[];
+  file_count: number;
+  profile_ids: string[];
+  columns: string[];
+  integrity_notes: string[];
+}
+
 export interface PlotModeMessageMetadata {
   kind: PlotModeMessageKind;
   title: string | null;
@@ -273,8 +303,11 @@ export interface PlotModeState {
   workspace_name: string;
   workspace_dir: string;
   files: PlotModeFile[];
+  input_bundle: PlotModeInputBundle | null;
   messages: PlotModeChatMessage[];
   data_profiles: PlotModeDataProfile[];
+  resolved_sources: PlotModeResolvedDataSource[];
+  active_resolved_source_ids: string[];
   selected_data_profile_id: string | null;
   tabular_selector: PlotModeTabularSelector | null;
   pending_question_set: PlotModeQuestionSet | null;
