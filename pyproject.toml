@@ -1,6 +1,6 @@
 [project]
 name = "openplot"
-version = "1.1.0"
+version = "1.1.2"
 description = "Makes plotting and fine-tuning plots easy and interactive."
 readme = "README.md"
 authors = [{ name = "Philo Wu", email = "philo.wu@codeboyphilo.ai" }]
