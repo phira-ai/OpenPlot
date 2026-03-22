@@ -269,6 +269,149 @@ def test_plot_mode_tilde_query_uses_home_directory_across_platforms(
     assert "chart.py" in suggested_names
 
 
+class _ChunkedTextReader:
+    def __init__(self, payload: str):
+        self._payload = payload.encode("utf-8")
+        self._offset = 0
+
+    async def read(self, n: int = -1) -> bytes:
+        if self._offset >= len(self._payload):
+            return b""
+        if n <= 0:
+            n = len(self._payload) - self._offset
+        start = self._offset
+        end = min(len(self._payload), start + n)
+        self._offset = end
+        return self._payload[start:end]
+
+
+class _FakeProcess:
+    def __init__(self, *, stdout_text: str, stderr_text: str = "", returncode: int = 0):
+        self.stdout = _ChunkedTextReader(stdout_text)
+        self.stderr = _ChunkedTextReader(stderr_text)
+        self.returncode = returncode
+        self.pid = 0
+
+    async def wait(self) -> int:
+        return self.returncode
+
+
+@pytest.mark.anyio
+async def test_run_plot_mode_runner_prompt_retries_after_builtin_question_tool(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    monkeypatch.setattr(server, "_resolve_claude_cli_command", lambda: "claude")
+
+    state = server.init_plot_mode_session(workspace_dir=tmp_path)
+    state.runner_session_ids["claude"] = "resume-123"
+    question_tool_line = json.dumps(
+        {
+            "type": "assistant",
+            "message": {
+                "content": [
+                    {
+                        "type": "tool_use",
+                        "name": "AskUserQuestion",
+                        "input": {
+                            "questions": [
+                                {
+                                    "question": "Which mode?",
+                                    "header": "Mode",
+                                    "multiSelect": False,
+                                    "options": [
+                                        {"label": "A", "description": "a"},
+                                        {"label": "B", "description": "b"},
+                                    ],
+                                }
+                            ]
+                        },
+                    }
+                ]
+            },
+        }
+    )
+
+    commands: list[list[str]] = []
+    processes = [
+        _FakeProcess(
+            stdout_text=f"{question_tool_line}\n",
+            returncode=1,
+        ),
+        _FakeProcess(stdout_text="done\n", returncode=0),
+    ]
+
+    async def fake_create_subprocess_exec(*command, **kwargs):
+        _ = kwargs
+        commands.append(list(command))
+        return processes.pop(0)
+
+    cleared_sessions: list[str] = []
+
+    monkeypatch.setattr(
+        server.asyncio, "create_subprocess_exec", fake_create_subprocess_exec
+    )
+    monkeypatch.setattr(
+        server,
+        "_clear_runner_session_id_for_plot_mode",
+        lambda _state, _runner: cleared_sessions.append(_runner),
+    )
+
+    assistant_text, runner_error = await server._run_plot_mode_runner_prompt(
+        state=state,
+        runner="claude",
+        prompt="Plan the next plot step.",
+        model="claude-sonnet-4-6",
+        variant="high",
+    )
+
+    assert runner_error is None
+    assert assistant_text == "done"
+    assert len(commands) == 2
+    assert "--resume" in commands[0]
+    assert "--resume" not in commands[1]
+    assert cleared_sessions == ["claude"]
+    assert "--disallowedTools" in commands[1]
+    assert "AskUserQuestion" in commands[1]
+    assert "Do not use AskUserQuestion" in commands[1][2]
+
+
+@pytest.mark.anyio
+async def test_run_plot_mode_runner_prompt_passes_opencode_question_disable_config(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    monkeypatch.setattr(server, "_resolve_command_path", lambda command: command)
+
+    state = server.init_plot_mode_session(workspace_dir=tmp_path)
+    captured_env: dict[str, str] = {}
+
+    async def fake_create_subprocess_exec(*command, **kwargs):
+        _ = command
+        captured_env.update(kwargs["env"])
+        return _FakeProcess(stdout_text="plain text response\n", returncode=0)
+
+    monkeypatch.setattr(
+        server.asyncio, "create_subprocess_exec", fake_create_subprocess_exec
+    )
+
+    assistant_text, runner_error = await server._run_plot_mode_runner_prompt(
+        state=state,
+        runner="opencode",
+        prompt="Plan the next plot step.",
+        model="openai/gpt-5.3-codex",
+        variant="high",
+    )
+
+    assert runner_error is None
+    assert assistant_text == "plain text response"
+    assert "OPENCODE_CONFIG_CONTENT" in captured_env
+    assert json.loads(captured_env["OPENCODE_CONFIG_CONTENT"]) == {
+        "$schema": "https://opencode.ai/config.json",
+        "permission": {"question": "deny"},
+    }
+
+
 def test_plot_mode_answer_targets_requested_workspace_when_another_is_active(
     monkeypatch,
     tmp_path: Path,
