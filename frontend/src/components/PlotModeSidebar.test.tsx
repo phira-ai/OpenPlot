@@ -122,6 +122,60 @@ function createQuestionState({ pending = true }: { pending?: boolean } = {}): Pl
   };
 }
 
+function createKickoffQuestionState(): PlotModeState {
+  const questionSet = {
+    id: "question-set-kickoff-1",
+    purpose: "kickoff_plot_planning" as const,
+    title: "Kickoff plot planning",
+    source_ids: [],
+    questions: [
+      {
+        id: "question-kickoff-1",
+        title: "Goal",
+        prompt: "What kind of plot should we plan?",
+        options: [
+          {
+            id: "option-kickoff-1",
+            label: "Start from this direction",
+            description: "Use this plan as the starting point",
+            recommended: true,
+          },
+        ],
+        allow_custom_answer: true,
+        multiple: false,
+        answered: false,
+        selected_option_ids: [],
+        answer_text: null,
+      },
+    ],
+  };
+
+  return {
+    ...createPlotModeState(),
+    messages: [
+      {
+        id: "assistant-question-kickoff-1",
+        role: "assistant",
+        content: "Tell me how you want to start planning this plot.",
+        metadata: {
+          kind: "question",
+          title: "Kickoff plot planning",
+          items: [],
+          table_columns: [],
+          table_rows: [],
+          table_caption: null,
+          table_source_label: null,
+          question_set_id: questionSet.id,
+          question_set_title: questionSet.title,
+          questions: questionSet.questions,
+        },
+        created_at: "2026-03-18T19:00:00Z",
+      },
+    ],
+    pending_question_set: questionSet,
+  };
+}
+
 function flushAnimationFrames() {
   const callbacks = [...rafCallbacksRef.current];
   rafCallbacksRef.current = [];
@@ -560,6 +614,68 @@ describe("PlotModeSidebar", () => {
 
     expect(container.textContent).toContain("Pick a plotting style");
     expect(container.textContent).not.toContain("Pick a color palette");
+  });
+
+  it("keeps typed kickoff text visible and submits it with the final selected option", async () => {
+    const onAnswerQuestion = vi.fn(async () => {});
+
+    await act(async () => {
+      root.render(
+        <PlotModeSidebar
+          state={createKickoffQuestionState()}
+          desktopViewport={false}
+          forceInitialFileSelection={false}
+          selectingFiles={false}
+          sendingMessage={false}
+          finalizing={false}
+          onFetchPathSuggestions={async () => ({
+            suggestions: [],
+            query: "",
+            selection_type: "data",
+            base_dir: "/tmp",
+          })}
+          onSelectPaths={async () => {}}
+          onSubmitTabularHint={async () => {}}
+          onSendMessage={async () => {}}
+          onShowError={() => {}}
+          plotModeExecutionMode="quick"
+          onChangePlotModeExecutionMode={async () => {}}
+          onAnswerQuestion={onAnswerQuestion}
+          onNext={async () => {}}
+        />,
+      );
+      flushAnimationFrames();
+    });
+
+    const textarea = container.querySelector<HTMLTextAreaElement>('textarea[placeholder="Type your answer"]');
+    const optionButton = Array.from(container.querySelectorAll<HTMLButtonElement>('button[type="button"]')).find(
+      (button) => button.textContent?.includes("Start from this direction"),
+    );
+
+    expect(textarea).not.toBeNull();
+    expect(optionButton).not.toBeNull();
+
+    await act(async () => {
+      const setValue = Object.getOwnPropertyDescriptor(HTMLTextAreaElement.prototype, "value")?.set;
+      setValue?.call(textarea!, "Focus on comparing the first two series.");
+      textarea!.dispatchEvent(new Event("input", { bubbles: true }));
+      textarea!.dispatchEvent(new Event("change", { bubbles: true }));
+    });
+
+    expect(textarea?.value).toBe("Focus on comparing the first two series.");
+    expect(container.textContent).toContain("Focus on comparing the first two series.");
+
+    await act(async () => {
+      optionButton!.click();
+    });
+
+    expect(onAnswerQuestion).toHaveBeenCalledWith("question-set-kickoff-1", [
+      {
+        question_id: "question-kickoff-1",
+        option_ids: ["option-kickoff-1"],
+        text: "Focus on comparing the first two series.",
+      },
+    ]);
   });
 
   it("uses a narrow desktop reveal strip for the prompt composer", async () => {

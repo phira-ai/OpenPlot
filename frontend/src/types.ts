@@ -142,6 +142,7 @@ export interface PlotModeQuestionSet {
     | "select_data_source"
     | "confirm_tabular_range"
     | "confirm_data_preview"
+    | "kickoff_plot_planning"
     | "continue_plot_planning"
     | "approve_plot_plan";
   title: string | null;

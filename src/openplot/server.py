@@ -3797,13 +3797,14 @@ def _populate_plot_mode_data_messages(state: PlotModeState) -> None:
 
     if not profiles:
         if state.resolved_sources:
-            state.phase = PlotModePhase.awaiting_prompt
+            state.phase = PlotModePhase.awaiting_data_choice
             for source in state.resolved_sources:
                 _append_plot_mode_activity(
                     state,
                     title="Source bundle ready",
                     items=[source.summary],
                 )
+            _queue_plot_mode_bundle_kickoff_question(state)
             return
         state.phase = PlotModePhase.awaiting_prompt
         return
@@ -3822,7 +3823,8 @@ def _populate_plot_mode_data_messages(state: PlotModeState) -> None:
                 title="Source bundle ready",
                 items=activity_items,
             )
-        state.phase = PlotModePhase.awaiting_prompt
+        state.phase = PlotModePhase.awaiting_data_choice
+        _queue_plot_mode_bundle_kickoff_question(state)
         return
 
     if len(profiles) == 1:
@@ -6192,6 +6194,37 @@ def _queue_plot_mode_continue_planning_question(
     )
 
 
+def _queue_plot_mode_bundle_kickoff_question(state: PlotModeState) -> None:
+    prompt = (
+        "Your source bundle is ready. Proceed to plot planning, "
+        "or tell me anything else to consider first."
+    )
+    question_set = PlotModeQuestionSet(
+        purpose="kickoff_plot_planning",
+        title="Ready to plan",
+        questions=[
+            PlotModeQuestionItem(
+                title="Next step",
+                prompt=prompt,
+                options=[
+                    PlotModeQuestionOption(
+                        id="proceed_to_planning",
+                        label="Proceed",
+                        description="Start planning the plot from this source bundle now.",
+                        recommended=True,
+                    )
+                ],
+                allow_custom_answer=True,
+            )
+        ],
+    )
+    _append_plot_mode_question_set(
+        state,
+        question_set=question_set,
+        lead_content=prompt,
+    )
+
+
 def _present_plot_mode_plan_result(
     state: PlotModeState,
     result: PlotModePlanResult,
@@ -6371,12 +6404,20 @@ async def _continue_plot_mode_planning(
     return True, None
 
 
-async def _start_plot_mode_planning_for_profile(
+def _default_plot_mode_planning_message(*, bundle: bool) -> str:
+    if bundle:
+        return (
+            "Inspect the confirmed source bundle, suggest the strongest figure, "
+            "and ask before drafting."
+        )
+    return "Inspect the confirmed source, suggest the strongest figure, and ask before drafting."
+
+
+async def _continue_plot_mode_planning_with_selected_runner(
+    *,
     state: PlotModeState,
-    profile: PlotModeDataProfile,
+    planning_message: str,
 ) -> tuple[bool, str | None]:
-    state.selected_data_profile_id = profile.id
-    _set_active_resolved_source_for_profile(state, profile)
     runner = _resolve_available_runner(
         _normalize_fix_runner(state.selected_runner, default=_default_fix_runner)
     )
@@ -6386,14 +6427,27 @@ async def _start_plot_mode_planning_for_profile(
     normalized_variant = (
         str(state.selected_variant).strip() if state.selected_variant else ""
     )
-    planning_message = state.latest_user_goal.strip() or (
-        "Inspect the confirmed source, suggest the strongest figure, and ask before drafting."
-    )
     return await _continue_plot_mode_planning(
         state=state,
         runner=runner,
         model=model,
         variant=normalized_variant or None,
+        planning_message=planning_message,
+    )
+
+
+async def _start_plot_mode_planning_for_profile(
+    state: PlotModeState,
+    profile: PlotModeDataProfile,
+) -> tuple[bool, str | None]:
+    state.selected_data_profile_id = profile.id
+    _set_active_resolved_source_for_profile(state, profile)
+    planning_message = (
+        state.latest_user_goal.strip()
+        or _default_plot_mode_planning_message(bundle=False)
+    )
+    return await _continue_plot_mode_planning_with_selected_runner(
+        state=state,
         planning_message=planning_message,
     )
 
@@ -10150,19 +10204,6 @@ def _register_routes(app: FastAPI) -> None:
             approval_message = answer_summary or answer_text or "Approved. Continue."
             _append_plot_mode_message(state, role="user", content=approval_message)
 
-            runner = _resolve_available_runner(
-                _normalize_fix_runner(
-                    state.selected_runner, default=_default_fix_runner
-                )
-            )
-            state.selected_runner = runner
-            _ensure_runner_is_available(runner)
-            model = str(state.selected_model or "").strip() or _runner_default_model_id(
-                runner
-            )
-            normalized_variant = (
-                str(state.selected_variant).strip() if state.selected_variant else ""
-            )
             planning_message = (
                 state.latest_user_goal.strip()
                 or state.latest_plan_summary.strip()
@@ -10173,11 +10214,49 @@ def _register_routes(app: FastAPI) -> None:
                     f"{planning_message}\n\nUser answers:\n{answer_summary}"
                 )
 
-            ok, error_message = await _continue_plot_mode_planning(
+            ok, error_message = await _continue_plot_mode_planning_with_selected_runner(
                 state=state,
-                runner=runner,
-                model=model,
-                variant=normalized_variant or None,
+                planning_message=planning_message,
+            )
+            if not ok:
+                return {
+                    "status": "error",
+                    "plot_mode": state.model_dump(mode="json"),
+                    "error": error_message or "Planning failed",
+                }
+            return {"status": "ok", "plot_mode": state.model_dump(mode="json")}
+
+        if pending.purpose == "kickoff_plot_planning":
+            decision = first_option_ids[0] if first_option_ids else ""
+            answer_text = (first_answer_text or "").strip()
+            if not decision and answer_text:
+                lowered = answer_text.lower()
+                if any(
+                    token in lowered for token in ["proceed", "continue", "go", "yes"]
+                ):
+                    decision = "proceed_to_planning"
+                else:
+                    decision = "custom_guidance"
+
+            if decision not in {"proceed_to_planning", "custom_guidance"}:
+                raise HTTPException(
+                    status_code=400,
+                    detail="Choose whether to proceed to planning or add guidance first.",
+                )
+
+            state.pending_question_set = None
+            _mark_question_set_answered(
+                state,
+                body.question_set_id,
+                answered_questions=answered_questions,
+            )
+
+            planning_message = answer_text or "Proceed to plot planning."
+            state.latest_user_goal = planning_message
+            _append_plot_mode_message(state, role="user", content=planning_message)
+
+            ok, error_message = await _continue_plot_mode_planning_with_selected_runner(
+                state=state,
                 planning_message=planning_message,
             )
             if not ok:
