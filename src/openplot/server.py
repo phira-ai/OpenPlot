@@ -3998,6 +3998,8 @@ def _build_plot_mode_prompt(state: PlotModeState, user_message: str) -> str:
         "- Produce one figure and save it to 'plot.png'.",
         "- Include imports and executable top-level code.",
         "- Do not request interactive input.",
+        "- Never use built-in question tools such as AskUserQuestion or question.",
+        "- If user input is absolutely required, return it only in the structured OpenPlot response format requested above so OpenPlot can render a question card.",
         "- Aim for a polished grant-application / top-conference-paper visual standard.",
         "",
         "Python runtime constraints (strict, must follow):",
@@ -4104,6 +4106,7 @@ def _build_plot_mode_planning_prompt(state: PlotModeState, user_message: str) ->
         "- If you need user input or approval, return one or more questions. Each question should have prompt, options, allow_custom_answer, and multiple.",
         "- Keep the JSON keys literal: use prompt and options, not question or choices.",
         "- Each options entry should be either a string label or an object with label plus optional id, description, and recommended.",
+        "- Never use built-in question tools such as AskUserQuestion or question.",
         "- Do not ask the user for missing inputs in free-form prose alone. Put every user-facing choice into the questions array so OpenPlot can render an interactive question card.",
         "- When asking a question, propose 2-5 discrete options first whenever possible, then allow a custom answer only as a fallback.",
         "- Use question_purpose='continue_plot_planning' when you need more user input before drafting.",
@@ -5335,6 +5338,135 @@ def _format_rate_limit_error(runner: FixRunner) -> str:
     return f"Backend rate limit reached ({runner}). Please wait a few minutes and try again."
 
 
+def _tool_name_is_builtin_question_tool(name: str | None) -> bool:
+    normalized = (name or "").strip().lower().replace("_", "").replace("-", "")
+    if not normalized:
+        return False
+    return normalized in {"askuserquestion", "question"}
+
+
+def _candidate_tool_names_from_parsed_event(parsed: dict[str, object]) -> list[str]:
+    part = _as_record(parsed.get("part")) or parsed
+    item = _as_record(parsed.get("item"))
+    candidates: list[str] = []
+    for candidate in (
+        _read_path(parsed, "part.tool_name"),
+        _read_path(parsed, "part.toolName"),
+        _read_path(parsed, "part.tool"),
+        _read_path(parsed, "part.tool.name"),
+        _read_path(parsed, "tool_name"),
+        _read_path(parsed, "toolName"),
+        _read_path(parsed, "tool"),
+        _read_path(parsed, "tool.name"),
+        _read_path(parsed, "name"),
+        _read_path(part, "name"),
+        _read_path(item, "tool") if item is not None else None,
+        _read_path(item, "name") if item is not None else None,
+        _read_path(item, "function.name") if item is not None else None,
+    ):
+        text = _as_string(candidate)
+        if text:
+            candidates.append(text)
+    return candidates
+
+
+def _parsed_runner_uses_builtin_question_tool(
+    runner: FixRunner, parsed: dict[str, object]
+) -> bool:
+    if runner == "claude":
+        root_type = (_as_string(parsed.get("type")) or "").lower().replace("_", "-")
+        if root_type == "stream-event":
+            event = _as_record(parsed.get("event"))
+            if event is None:
+                return False
+            event_type = (_as_string(event.get("type")) or "").lower().replace("_", "-")
+            if event_type != "content-block-start":
+                return False
+            content_block = _as_record(event.get("content_block"))
+            if content_block is None:
+                return False
+            block_type = (
+                (_as_string(content_block.get("type")) or "").lower().replace("_", "-")
+            )
+            return block_type == "tool-use" and _tool_name_is_builtin_question_tool(
+                _as_string(content_block.get("name"))
+            )
+
+        message = _as_record(parsed.get("message"))
+        if message is not None and isinstance(message.get("content"), list):
+            for block_value in cast(list[object], message.get("content")):
+                block = _as_record(block_value)
+                if block is None:
+                    continue
+                block_type = (
+                    (_as_string(block.get("type")) or "").lower().replace("_", "-")
+                )
+                if block_type not in {"tool-use", "tool_use"}:
+                    continue
+                if _tool_name_is_builtin_question_tool(_as_string(block.get("name"))):
+                    return True
+        return False
+
+    part = _as_record(parsed.get("part")) or parsed
+    event_type = (
+        (_as_string(parsed.get("type")) or _as_string(parsed.get("event")) or "")
+        .lower()
+        .replace("_", "-")
+    )
+    part_type = (_as_string(part.get("type")) or "").lower().replace("_", "-")
+    item = _as_record(parsed.get("item"))
+    item_type = (
+        ((_as_string(item.get("type")) or "") if item is not None else "")
+        .lower()
+        .replace("_", "-")
+    )
+    if "tool" not in event_type and "tool" not in part_type and "tool" not in item_type:
+        return False
+
+    return any(
+        _tool_name_is_builtin_question_tool(candidate)
+        for candidate in _candidate_tool_names_from_parsed_event(parsed)
+    )
+
+
+def _runner_output_used_builtin_question_tool(runner: FixRunner, text: str) -> bool:
+    for line in text.splitlines():
+        parsed = _parse_json_event_line(line)
+        if parsed is None:
+            continue
+        if _parsed_runner_uses_builtin_question_tool(runner, parsed):
+            return True
+    return False
+
+
+def _append_retry_instruction(prompt: str, instruction: str) -> str:
+    normalized_instruction = instruction.strip()
+    if not normalized_instruction:
+        return prompt
+    if normalized_instruction in prompt:
+        return prompt
+    return f"{prompt.rstrip()}\n\nAdditional instruction: {normalized_instruction}"
+
+
+def _plot_mode_question_tool_retry_instruction() -> str:
+    return (
+        "The previous attempt tried to use a built-in interactive question tool. "
+        "OpenPlot cannot answer built-in runner questions in CLI mode. "
+        "Do not use AskUserQuestion or question tools. "
+        "If user input is required, return it only in the structured OpenPlot response format requested above so OpenPlot can render a question card."
+    )
+
+
+def _fix_mode_question_tool_retry_instruction() -> str:
+    return (
+        "The previous attempt tried to use a built-in interactive question tool. "
+        "OpenPlot cannot answer built-in runner questions during fix mode. "
+        "Do not use AskUserQuestion or question tools. "
+        "Do not ask the user for interactive input. "
+        "Infer the most conservative interpretation from the current annotation, current script, and existing accepted fixes, then continue."
+    )
+
+
 def _extract_plot_mode_assistant_text(
     parsed: dict[str, object], part: dict[str, object]
 ) -> str | None:
@@ -5505,15 +5637,47 @@ def _extract_plot_mode_stream_fragment(
 async def _consume_plot_mode_text_stream(
     stream: asyncio.StreamReader | None,
     sink: list[str],
+    *,
+    runner: FixRunner | None = None,
+    process: asyncio.subprocess.Process | None = None,
 ) -> None:
     if stream is None:
         return
+
+    buffered = ""
+    question_tool_seen = False
 
     while True:
         chunk_bytes = await stream.read(8192)
         if not chunk_bytes:
             break
-        sink.append(chunk_bytes.decode("utf-8", errors="replace"))
+
+        chunk = chunk_bytes.decode("utf-8", errors="replace")
+        sink.append(chunk)
+
+        if runner is None or process is None or question_tool_seen:
+            continue
+
+        buffered += chunk
+        while True:
+            newline_index = buffered.find("\n")
+            if newline_index < 0:
+                break
+            line = buffered[: newline_index + 1]
+            buffered = buffered[newline_index + 1 :]
+            parsed = _parse_json_event_line(line)
+            if parsed is None:
+                continue
+            if _parsed_runner_uses_builtin_question_tool(runner, parsed):
+                question_tool_seen = True
+                await _terminate_fix_process(process)
+                break
+
+    if runner is None or process is None or question_tool_seen or not buffered:
+        return
+    parsed = _parse_json_event_line(buffered)
+    if parsed is not None and _parsed_runner_uses_builtin_question_tool(runner, parsed):
+        await _terminate_fix_process(process)
 
 
 def _resolve_plot_mode_final_assistant_text(
@@ -5564,6 +5728,8 @@ async def _run_plot_mode_runner_prompt(
     variant: str | None,
 ) -> tuple[str, str | None]:
     current_resume_session_id = _runner_session_id_for_plot_mode(state, runner)
+    current_prompt = prompt
+    question_tool_retry_count = 0
     return_code: int | None = None
     stdout_text = ""
     stderr_text = ""
@@ -5620,7 +5786,7 @@ async def _run_plot_mode_runner_prompt(
                         f"model_reasoning_effort={json.dumps(normalized_variant)}",
                     ]
                 )
-            command.append(prompt)
+                command.append(current_prompt)
         elif runner == "claude":
             claude_command = _resolve_claude_cli_command()
             if claude_command is None:
@@ -5629,13 +5795,15 @@ async def _run_plot_mode_runner_prompt(
             command = [
                 claude_command,
                 "-p",
-                prompt,
+                current_prompt,
                 "--output-format",
                 "stream-json",
                 "--verbose",
                 "--include-partial-messages",
                 "--permission-mode",
                 "bypassPermissions",
+                "--disallowedTools",
+                "AskUserQuestion",
                 "--model",
                 model,
             ]
@@ -5663,13 +5831,21 @@ async def _run_plot_mode_runner_prompt(
                 command.extend(["--session", normalized_resume_session_id])
             if variant:
                 command.extend(["--variant", variant])
-            command.append(prompt)
+            command.append(current_prompt)
+
+        env_overrides = (
+            {
+                "OPENCODE_CONFIG_CONTENT": _opencode_question_tool_disabled_config_content()
+            }
+            if runner == "opencode"
+            else None
+        )
 
         try:
             process = await asyncio.create_subprocess_exec(
                 *command,
                 cwd=str(state.workspace_dir),
-                env=_subprocess_env(),
+                env=_subprocess_env(overrides=env_overrides),
                 stdin=asyncio.subprocess.DEVNULL,
                 stdout=asyncio.subprocess.PIPE,
                 stderr=asyncio.subprocess.PIPE,
@@ -5685,7 +5861,9 @@ async def _run_plot_mode_runner_prompt(
         stderr_chunks: list[str] = []
 
         stdout_task = asyncio.create_task(
-            _consume_plot_mode_text_stream(process.stdout, stdout_chunks)
+            _consume_plot_mode_text_stream(
+                process.stdout, stdout_chunks, runner=runner, process=process
+            )
         )
         stderr_task = asyncio.create_task(
             _consume_plot_mode_text_stream(process.stderr, stderr_chunks)
@@ -5729,6 +5907,20 @@ async def _run_plot_mode_runner_prompt(
 
         if output_path is not None:
             output_path.unlink(missing_ok=True)
+
+        if _runner_output_used_builtin_question_tool(runner, stdout_text):
+            _clear_runner_session_id_for_plot_mode(state, runner)
+            if question_tool_retry_count >= 1:
+                return assistant_text, (
+                    "Runner attempted an unsupported built-in question tool. "
+                    "Please try again after clarifying the request in plain language."
+                )
+            current_resume_session_id = None
+            current_prompt = _append_retry_instruction(
+                current_prompt, _plot_mode_question_tool_retry_instruction()
+            )
+            question_tool_retry_count += 1
+            continue
 
         if (
             return_code != 0
@@ -6741,9 +6933,19 @@ def _opencode_fix_config_content() -> str:
                 "timeout": 20000,
             }
         },
+        "permission": {"question": "deny"},
         "tools": {"openplot_*": True},
     }
     return json.dumps(config)
+
+
+def _opencode_question_tool_disabled_config_content() -> str:
+    return json.dumps(
+        {
+            "$schema": "https://opencode.ai/config.json",
+            "permission": {"question": "deny"},
+        }
+    )
 
 
 def _build_codex_plot_fix_prompt(*, extra_prompt: str | None = None) -> str:
@@ -6770,6 +6972,9 @@ def _build_codex_plot_fix_prompt(*, extra_prompt: str | None = None) -> str:
         "apply ambiguous references (for example, 'this', 'these', 'each line') "
         "only to elements visible in that selected region unless the feedback "
         "explicitly requests global edits. "
+        "Never use built-in interactive question tools such as AskUserQuestion or question. "
+        "Do not ask the user for interactive input during fix mode. "
+        "If the annotation is ambiguous, infer the most conservative interpretation from the current script, pending annotation, and existing accepted fixes, then continue. "
         "Never execute shell commands named openplot_*; these are MCP tools."
     )
     if extra_prompt:
@@ -6888,6 +7093,8 @@ def _build_claude_plot_fix_command(
         "--include-partial-messages",
         "--permission-mode",
         "bypassPermissions",
+        "--disallowedTools",
+        "AskUserQuestion",
         "--strict-mcp-config",
         "--add-dir",
         str(resolved_workspace),
@@ -8371,6 +8578,8 @@ async def _consume_fix_stream(
     *,
     job: FixJob,
     step: FixJobStep,
+    runner: FixRunner,
+    process: asyncio.subprocess.Process,
     stream_name: Literal["stdout", "stderr"],
     stream: asyncio.StreamReader | None,
     sink: list[str],
@@ -8379,6 +8588,7 @@ async def _consume_fix_stream(
         return
 
     buffered = ""
+    question_tool_seen = False
 
     while True:
         chunk_bytes = await stream.read(8192)
@@ -8397,6 +8607,13 @@ async def _consume_fix_stream(
             buffered = buffered[newline_index + 1 :]
 
             parsed = _parse_json_event_line(line) if stream_name == "stdout" else None
+            if (
+                parsed is not None
+                and not question_tool_seen
+                and _parsed_runner_uses_builtin_question_tool(runner, parsed)
+            ):
+                question_tool_seen = True
+                await _terminate_fix_process(process)
             await _broadcast_fix_job_log(
                 job_id=job.id,
                 step_index=step.index,
@@ -8408,6 +8625,12 @@ async def _consume_fix_stream(
 
     if buffered:
         parsed = _parse_json_event_line(buffered) if stream_name == "stdout" else None
+        if (
+            parsed is not None
+            and not question_tool_seen
+            and _parsed_runner_uses_builtin_question_tool(runner, parsed)
+        ):
+            await _terminate_fix_process(process)
         await _broadcast_fix_job_log(
             job_id=job.id,
             step_index=step.index,
@@ -8451,6 +8674,8 @@ async def _run_fix_iteration_command(
         _consume_fix_stream(
             job=job,
             step=step,
+            runner=job.runner,
+            process=process,
             stream_name="stdout",
             stream=process.stdout,
             sink=stdout_chunks,
@@ -8460,6 +8685,8 @@ async def _run_fix_iteration_command(
         _consume_fix_stream(
             job=job,
             step=step,
+            runner=job.runner,
+            process=process,
             stream_name="stderr",
             stream=process.stderr,
             sink=stderr_chunks,
@@ -8519,6 +8746,27 @@ async def _run_opencode_fix_iteration(
         env_overrides=env_overrides,
     )
 
+    if _runner_output_used_builtin_question_tool("opencode", raw_stdout):
+        _clear_runner_session_id_for_session(session, "opencode")
+        command = _build_opencode_plot_fix_command(
+            model=job.model,
+            variant=job.variant,
+            workspace_dir=workspace_dir,
+            resume_session_id=None,
+            extra_prompt=_append_retry_instruction(
+                extra_prompt or "", _fix_mode_question_tool_retry_instruction()
+            ),
+        )
+        display_command = [*command[:-1], "<plot-fix prompt>"]
+        raw_stdout, raw_stderr = await _run_fix_iteration_command(
+            job=job,
+            step=step,
+            command=command,
+            display_command=display_command,
+            cwd=workspace_dir,
+            env_overrides=env_overrides,
+        )
+
     if (
         step.exit_code != 0
         and resume_session_id
@@ -8542,6 +8790,12 @@ async def _run_opencode_fix_iteration(
             display_command=display_command,
             cwd=workspace_dir,
             env_overrides=env_overrides,
+        )
+
+    if _runner_output_used_builtin_question_tool("opencode", raw_stdout):
+        step.exit_code = 1
+        step.stderr = _truncate_output(
+            "Runner attempted an unsupported built-in question tool during fix mode."
         )
 
     discovered_session_id = _extract_runner_session_id_from_output(
@@ -8579,6 +8833,27 @@ async def _run_codex_fix_iteration(
         env_overrides=env_overrides,
     )
 
+    if _runner_output_used_builtin_question_tool("codex", raw_stdout):
+        _clear_runner_session_id_for_session(session, "codex")
+        command = _build_codex_plot_fix_command(
+            model=job.model,
+            variant=job.variant,
+            workspace_dir=workspace_dir,
+            resume_session_id=None,
+            extra_prompt=_append_retry_instruction(
+                extra_prompt or "", _fix_mode_question_tool_retry_instruction()
+            ),
+        )
+        display_command = [*command[:-1], "<plot-fix prompt>"]
+        raw_stdout, raw_stderr = await _run_fix_iteration_command(
+            job=job,
+            step=step,
+            command=command,
+            display_command=display_command,
+            cwd=workspace_dir,
+            env_overrides=env_overrides,
+        )
+
     if (
         step.exit_code != 0
         and resume_session_id
@@ -8602,6 +8877,12 @@ async def _run_codex_fix_iteration(
             display_command=display_command,
             cwd=workspace_dir,
             env_overrides=env_overrides,
+        )
+
+    if _runner_output_used_builtin_question_tool("codex", raw_stdout):
+        step.exit_code = 1
+        step.stderr = _truncate_output(
+            "Runner attempted an unsupported built-in question tool during fix mode."
         )
 
     discovered_session_id = _extract_runner_session_id_from_output("codex", raw_stdout)
@@ -8644,6 +8925,34 @@ async def _run_claude_fix_iteration(
         stderr_text=raw_stderr,
     )
 
+    if _runner_output_used_builtin_question_tool("claude", raw_stdout):
+        _clear_runner_session_id_for_session(session, "claude")
+        command = _build_claude_plot_fix_command(
+            model=job.model,
+            variant=job.variant,
+            workspace_dir=workspace_dir,
+            resume_session_id=None,
+            extra_prompt=_append_retry_instruction(
+                extra_prompt or "", _fix_mode_question_tool_retry_instruction()
+            ),
+        )
+        display_command = [*command]
+        if len(display_command) >= 3:
+            display_command[2] = "<plot-fix prompt>"
+        raw_stdout, raw_stderr = await _run_fix_iteration_command(
+            job=job,
+            step=step,
+            command=command,
+            display_command=display_command,
+            cwd=workspace_dir,
+            env_overrides=env_overrides,
+        )
+        reported_error = _extract_runner_reported_error(
+            "claude",
+            stdout_text=raw_stdout,
+            stderr_text=raw_stderr,
+        )
+
     if resume_session_id and (
         (
             step.exit_code != 0
@@ -8678,6 +8987,12 @@ async def _run_claude_fix_iteration(
             "claude",
             stdout_text=raw_stdout,
             stderr_text=raw_stderr,
+        )
+
+    if _runner_output_used_builtin_question_tool("claude", raw_stdout):
+        step.exit_code = 1
+        step.stderr = _truncate_output(
+            "Runner attempted an unsupported built-in question tool during fix mode."
         )
 
     if reported_error is not None and step.exit_code == 0:

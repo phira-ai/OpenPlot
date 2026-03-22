@@ -1007,6 +1007,32 @@ def test_opencode_fix_config_content_enables_openplot_mcp_tools() -> None:
     assert payload["tools"]["openplot_*"] is True
 
 
+def test_opencode_fix_config_content_denies_builtin_question_tool() -> None:
+    payload = json.loads(server._opencode_fix_config_content())
+
+    assert payload["permission"]["question"] == "deny"
+
+
+def test_opencode_plot_mode_config_only_disables_builtin_question_tool() -> None:
+    payload = json.loads(server._opencode_question_tool_disabled_config_content())
+
+    assert payload == {
+        "$schema": "https://opencode.ai/config.json",
+        "permission": {"question": "deny"},
+    }
+
+
+def test_runner_output_detects_opencode_question_tool_event() -> None:
+    line = json.dumps(
+        {
+            "type": "tool_call",
+            "part": {"type": "tool", "tool_name": "question", "name": "question"},
+        }
+    )
+
+    assert server._runner_output_used_builtin_question_tool("opencode", f"{line}\n")
+
+
 def test_build_codex_fix_command_skips_git_repo_check() -> None:
     command = server._build_codex_plot_fix_command(
         model="gpt-5.2-codex",
@@ -1079,6 +1105,117 @@ def test_build_claude_fix_command_uses_resume_session(monkeypatch, tmp_path) -> 
     assert command[resume_index + 1] == "f326437b-19b6-42d6-b7ae-a025731e8f72"
 
 
+def test_build_claude_fix_command_disables_ask_user_question(
+    monkeypatch, tmp_path
+) -> None:
+    monkeypatch.setattr(server, "_resolve_claude_cli_command", lambda: "claude")
+
+    command = server._build_claude_plot_fix_command(
+        model="claude-sonnet-4-6",
+        variant="high",
+        workspace_dir=tmp_path,
+    )
+
+    assert "--disallowedTools" in command
+    disallowed_tools_index = command.index("--disallowedTools")
+    assert command[disallowed_tools_index + 1] == "AskUserQuestion"
+
+
+@pytest.mark.anyio
+async def test_run_claude_fix_iteration_retries_after_builtin_question_tool(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    monkeypatch.setattr(server, "_resolve_claude_cli_command", lambda: "claude")
+
+    session = PlotSession(
+        id="session-123", source_script_path=str(tmp_path / "plot.py")
+    )
+    job = FixJob(
+        runner="claude",
+        model="claude-sonnet-4-6",
+        variant="high",
+        session_id=session.id,
+        workspace_dir=str(tmp_path),
+        branch_id="branch-main",
+        branch_name="main",
+    )
+    step = FixJobStep(index=0, annotation_id="annotation-1")
+
+    commands: list[list[str]] = []
+    cleared_sessions: list[tuple[str, str]] = []
+    question_tool_line = json.dumps(
+        {
+            "type": "assistant",
+            "message": {
+                "content": [
+                    {
+                        "type": "tool_use",
+                        "name": "AskUserQuestion",
+                        "input": {
+                            "questions": [
+                                {
+                                    "question": "Which mode?",
+                                    "header": "Mode",
+                                    "multiSelect": False,
+                                    "options": [
+                                        {"label": "A", "description": "a"},
+                                        {"label": "B", "description": "b"},
+                                    ],
+                                }
+                            ]
+                        },
+                    }
+                ]
+            },
+        }
+    )
+
+    async def fake_run_fix_iteration_command(**kwargs):
+        command = list(cast(list[str], kwargs["command"]))
+        commands.append(command)
+        if len(commands) == 1:
+            step.exit_code = 1
+            return (f"{question_tool_line}\n", "")
+        step.exit_code = 0
+        return ("done\n", "")
+
+    monkeypatch.setattr(server, "_session_for_fix_job", lambda _job: session)
+    monkeypatch.setattr(
+        server, "_workspace_dir_for_fix_job", lambda _job, _session: tmp_path
+    )
+    monkeypatch.setattr(server, "_fix_runner_env_overrides", lambda _job, _session: {})
+    monkeypatch.setattr(
+        server, "_runner_session_id_for_session", lambda _session, _runner: "resume-123"
+    )
+    monkeypatch.setattr(
+        server,
+        "_clear_runner_session_id_for_session",
+        lambda _session, runner: cleared_sessions.append((_session.id, runner)),
+    )
+    monkeypatch.setattr(
+        server, "_run_fix_iteration_command", fake_run_fix_iteration_command
+    )
+    monkeypatch.setattr(
+        server, "_extract_runner_session_id_from_output", lambda _runner, _stdout: None
+    )
+    monkeypatch.setattr(
+        server,
+        "_extract_runner_reported_error",
+        lambda _runner, stdout_text, stderr_text: None,
+    )
+
+    await server._run_claude_fix_iteration(job, step)
+
+    assert len(commands) == 2
+    assert "--resume" in commands[0]
+    assert "--resume" not in commands[1]
+    assert cleared_sessions == [(session.id, "claude")]
+    assert "--disallowedTools" in commands[1]
+    assert "AskUserQuestion" in commands[1]
+    assert "Do not use AskUserQuestion" in commands[1][2]
+
+
 def test_workspace_dir_for_fix_job_prefers_session_context(tmp_path: Path) -> None:
     session_workspace = tmp_path / "session-workspace"
     session_workspace.mkdir(parents=True)
@@ -1123,6 +1260,10 @@ def test_fix_runner_env_overrides_include_runtime_shims(
     assert overrides["OPENPLOT_SERVER_URL"] == "http://127.0.0.1:17623"
     assert (
         json.loads(overrides["OPENCODE_CONFIG_CONTENT"])["tools"]["openplot_*"] is True
+    )
+    assert (
+        json.loads(overrides["OPENCODE_CONFIG_CONTENT"])["permission"]["question"]
+        == "deny"
     )
     assert "PYTHONPATH" in overrides
 
@@ -1294,6 +1435,7 @@ def test_consume_fix_stream_handles_long_json_lines(monkeypatch) -> None:
         captured_logs.append(kwargs)
 
     monkeypatch.setattr(server, "_broadcast_fix_job_log", fake_broadcast_fix_job_log)
+    monkeypatch.setattr(server, "_terminate_fix_process", lambda process: None)
 
     job = FixJob(
         model="openai/gpt-5.3-codex",
@@ -1306,6 +1448,8 @@ def test_consume_fix_stream_handles_long_json_lines(monkeypatch) -> None:
         server._consume_fix_stream(
             job=job,
             step=step,
+            runner="opencode",
+            process=cast(asyncio.subprocess.Process, object()),
             stream_name="stdout",
             stream=cast(asyncio.StreamReader, reader),
             sink=sink,
