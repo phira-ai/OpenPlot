@@ -643,7 +643,7 @@ def test_plot_mode_rejects_adding_more_files_after_initial_selection(
     )
 
 
-def test_plot_mode_multiple_csvs_resolve_to_a_combined_bundle_source(
+def test_plot_mode_multi_csv_bundle_resolves_to_a_combined_bundle_source(
     monkeypatch,
     tmp_path: Path,
 ) -> None:
@@ -669,8 +669,13 @@ def test_plot_mode_multiple_csvs_resolve_to_a_combined_bundle_source(
 
     assert response.status_code == 200
     plot_mode = response.json()["plot_mode"]
-    assert plot_mode["phase"] == "awaiting_prompt"
-    assert plot_mode["pending_question_set"] is None
+    assert plot_mode["phase"] == "awaiting_data_choice"
+    assert plot_mode["pending_question_set"] is not None
+    assert plot_mode["pending_question_set"]["purpose"] == "kickoff_plot_planning"
+    assert (
+        plot_mode["pending_question_set"]["questions"][0]["options"][0]["id"]
+        == "proceed_to_planning"
+    )
     assert plot_mode["selected_data_profile_id"] is None
     table_previews = [
         message
@@ -710,7 +715,9 @@ def test_plot_mode_multi_csv_bundle_tolerates_reordered_headers(
 
     assert response.status_code == 200
     plot_mode = response.json()["plot_mode"]
-    assert plot_mode["phase"] == "awaiting_prompt"
+    assert plot_mode["phase"] == "awaiting_data_choice"
+    assert plot_mode["pending_question_set"] is not None
+    assert plot_mode["pending_question_set"]["purpose"] == "kickoff_plot_planning"
     assert len(plot_mode["resolved_sources"]) == 1
     assert plot_mode["resolved_sources"][0]["kind"] == "multi_file_collection"
 
@@ -759,16 +766,240 @@ def test_plot_mode_chat_accepts_a_combined_multi_file_bundle(
             json={"selection_type": "data", "paths": [str(first), str(second)]},
         )
         assert select_response.status_code == 200
+        kickoff_question = select_response.json()["plot_mode"]["pending_question_set"]
 
-        chat_response = client.post(
-            "/api/plot-mode/chat",
-            json={"message": "Compare both files as two lines."},
+        answer_response = client.post(
+            "/api/plot-mode/answer",
+            json={
+                "question_set_id": kickoff_question["id"],
+                "answers": [
+                    {
+                        "question_id": kickoff_question["questions"][0]["id"],
+                        "text": "Compare both files as two lines.",
+                    }
+                ],
+            },
         )
 
-    assert chat_response.status_code == 200
+    assert answer_response.status_code == 200
     assert seen["message"] == "Compare both files as two lines."
     assert seen["selected_data_profile_id"] is None
     assert len(cast(list[str], seen["active_resolved_source_ids"])) == 1
+    payload = answer_response.json()["plot_mode"]
+    assert payload["latest_user_goal"] == "Compare both files as two lines."
+    question_messages = [
+        message
+        for message in payload["messages"]
+        if (message.get("metadata") or {}).get("kind") == "question"
+    ]
+    assert question_messages
+    assert question_messages[-1]["metadata"]["questions"][0]["answered"] is True
+    assert question_messages[-1]["metadata"]["questions"][0]["answer_text"] == (
+        "Compare both files as two lines."
+    )
+    user_messages = [
+        message["content"]
+        for message in payload["messages"]
+        if message["role"] == "user"
+    ]
+    assert user_messages == ["Compare both files as two lines."]
+
+
+def test_plot_mode_kickoff_answer_proceeds_to_planning_for_bundle_source(
+    monkeypatch,
+    tmp_path: Path,
+) -> None:
+    monkeypatch.setenv("XDG_STATE_HOME", str(tmp_path / "state"))
+    workspace = tmp_path / "workspace"
+    workspace.mkdir(parents=True, exist_ok=True)
+    first = workspace / "first.csv"
+    second = workspace / "second.csv"
+    first.write_text("x,y\n1,2\n")
+    second.write_text("x,y\n2,3\n")
+
+    seen: dict[str, object] = {}
+
+    async def _fake_planning(
+        *,
+        state,
+        runner,
+        user_message,
+        model,
+        variant,
+    ):
+        _ = (runner, model, variant)
+        seen["message"] = user_message
+        seen["selected_data_profile_id"] = state.selected_data_profile_id
+        seen["active_resolved_source_ids"] = list(state.active_resolved_source_ids)
+        return server.PlotModePlanResult(
+            assistant_text="I inspected the source bundle and prepared a plan.",
+            summary="I can compare the files as separate series.",
+            plot_type="line chart",
+            plan_outline=["Compare the files as separate lines on one chart."],
+            data_actions=["Inspect both CSV files and align their shared columns."],
+            ready_to_plot=False,
+            clarification_question="Should I refine the comparison before drafting?",
+        )
+
+    monkeypatch.setattr(server, "_run_plot_mode_planning", _fake_planning)
+    server.init_plot_mode_session(workspace_dir=workspace)
+
+    with TestClient(server.create_app()) as client:
+        select_response = client.post(
+            "/api/plot-mode/select-paths",
+            json={"selection_type": "data", "paths": [str(first), str(second)]},
+        )
+        assert select_response.status_code == 200
+        kickoff_question = select_response.json()["plot_mode"]["pending_question_set"]
+
+        answer_response = client.post(
+            "/api/plot-mode/answer",
+            json={
+                "question_set_id": kickoff_question["id"],
+                "answers": [
+                    {
+                        "question_id": kickoff_question["questions"][0]["id"],
+                        "option_ids": ["proceed_to_planning"],
+                    }
+                ],
+            },
+        )
+
+    assert answer_response.status_code == 200
+    assert seen["message"] == "Proceed to plot planning."
+    assert seen["selected_data_profile_id"] is None
+    assert len(cast(list[str], seen["active_resolved_source_ids"])) == 1
+    payload = answer_response.json()["plot_mode"]
+    assert payload["phase"] == "awaiting_data_choice"
+    assert payload["pending_question_set"]["purpose"] == "continue_plot_planning"
+    assert payload["latest_user_goal"] == "Proceed to plot planning."
+    question_messages = [
+        message
+        for message in payload["messages"]
+        if (message.get("metadata") or {}).get("kind") == "question"
+    ]
+    assert question_messages
+    assert question_messages[0]["metadata"]["questions"][0]["answered"] is True
+    user_messages = [
+        message["content"]
+        for message in payload["messages"]
+        if message["role"] == "user"
+    ]
+    assert user_messages == ["Proceed to plot planning."]
+
+
+def test_plot_mode_kickoff_answer_requires_proceed_or_guidance(
+    monkeypatch,
+    tmp_path: Path,
+) -> None:
+    monkeypatch.setenv("XDG_STATE_HOME", str(tmp_path / "state"))
+    workspace = tmp_path / "workspace"
+    workspace.mkdir(parents=True, exist_ok=True)
+    first = workspace / "first.csv"
+    second = workspace / "second.csv"
+    first.write_text("x,y\n1,2\n")
+    second.write_text("x,y\n2,3\n")
+
+    server.init_plot_mode_session(workspace_dir=workspace)
+
+    with TestClient(server.create_app()) as client:
+        select_response = client.post(
+            "/api/plot-mode/select-paths",
+            json={"selection_type": "data", "paths": [str(first), str(second)]},
+        )
+        assert select_response.status_code == 200
+        kickoff_question = select_response.json()["plot_mode"]["pending_question_set"]
+
+        answer_response = client.post(
+            "/api/plot-mode/answer",
+            json={
+                "question_set_id": kickoff_question["id"],
+                "answers": [
+                    {
+                        "question_id": kickoff_question["questions"][0]["id"],
+                        "option_ids": [],
+                        "text": "   ",
+                    }
+                ],
+            },
+        )
+
+    assert answer_response.status_code == 400
+    assert answer_response.json()["detail"] == (
+        "Choose whether to proceed to planning or add guidance first."
+    )
+
+
+def test_plot_mode_kickoff_answer_prefers_custom_guidance_over_proceed_option(
+    monkeypatch,
+    tmp_path: Path,
+) -> None:
+    monkeypatch.setenv("XDG_STATE_HOME", str(tmp_path / "state"))
+    workspace = tmp_path / "workspace"
+    workspace.mkdir(parents=True, exist_ok=True)
+    first = workspace / "first.csv"
+    second = workspace / "second.csv"
+    first.write_text("x,y\n1,2\n")
+    second.write_text("x,y\n2,3\n")
+
+    seen: dict[str, object] = {}
+
+    async def _fake_planning(
+        *,
+        state,
+        runner,
+        user_message,
+        model,
+        variant,
+    ):
+        _ = (state, runner, model, variant)
+        seen["message"] = user_message
+        return server.PlotModePlanResult(
+            assistant_text="I refined the plot direction.",
+            summary="The comparison should highlight the smaller model.",
+            plot_type="line chart",
+            plan_outline=["Compare both files and emphasize the smaller model."],
+            data_actions=["Align shared columns before plotting."],
+            ready_to_plot=False,
+        )
+
+    monkeypatch.setattr(server, "_run_plot_mode_planning", _fake_planning)
+    server.init_plot_mode_session(workspace_dir=workspace)
+
+    with TestClient(server.create_app()) as client:
+        select_response = client.post(
+            "/api/plot-mode/select-paths",
+            json={"selection_type": "data", "paths": [str(first), str(second)]},
+        )
+        assert select_response.status_code == 200
+        kickoff_question = select_response.json()["plot_mode"]["pending_question_set"]
+
+        answer_response = client.post(
+            "/api/plot-mode/answer",
+            json={
+                "question_set_id": kickoff_question["id"],
+                "answers": [
+                    {
+                        "question_id": kickoff_question["questions"][0]["id"],
+                        "option_ids": ["proceed_to_planning"],
+                        "text": "Compare accuracy, but call out the smallest model.",
+                    }
+                ],
+            },
+        )
+
+    assert answer_response.status_code == 200
+    assert seen["message"] == "Compare accuracy, but call out the smallest model."
+    payload = answer_response.json()["plot_mode"]
+    assert payload["latest_user_goal"] == (
+        "Compare accuracy, but call out the smallest model."
+    )
+    user_messages = [
+        message["content"]
+        for message in payload["messages"]
+        if message["role"] == "user"
+    ]
+    assert user_messages == ["Compare accuracy, but call out the smallest model."]
 
 
 def test_plot_mode_unsupported_preview_file_skips_data_confirmation(
@@ -828,8 +1059,13 @@ def test_plot_mode_mixed_file_selection_resolves_to_a_bundle_source(
         )
         assert select_response.status_code == 200
         plot_mode = select_response.json()["plot_mode"]
-        assert plot_mode["phase"] == "awaiting_prompt"
-        assert plot_mode["pending_question_set"] is None
+        assert plot_mode["phase"] == "awaiting_data_choice"
+        assert plot_mode["pending_question_set"] is not None
+        assert plot_mode["pending_question_set"]["purpose"] == "kickoff_plot_planning"
+        assert (
+            plot_mode["pending_question_set"]["questions"][0]["options"][0]["id"]
+            == "proceed_to_planning"
+        )
         assert plot_mode["selected_data_profile_id"] is None
         assert len(plot_mode["resolved_sources"]) == 1
         resolved_source = plot_mode["resolved_sources"][0]
@@ -1231,8 +1467,9 @@ def test_plot_mode_multiple_csvs_skip_the_source_selection_question(
         assert select_response.status_code == 200
 
     payload = select_response.json()["plot_mode"]
-    assert payload["phase"] == "awaiting_prompt"
-    assert payload["pending_question_set"] is None
+    assert payload["phase"] == "awaiting_data_choice"
+    assert payload["pending_question_set"] is not None
+    assert payload["pending_question_set"]["purpose"] == "kickoff_plot_planning"
     assert payload["selected_data_profile_id"] is None
     assert len(payload["resolved_sources"]) == 1
     assert payload["resolved_sources"][0]["kind"] == "multi_file_collection"
