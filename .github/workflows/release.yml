@@ -120,6 +120,14 @@ jobs:
           fi
           "${cmd[@]}"
 
+      - name: Install Nix
+        uses: DeterminateSystems/nix-installer-action@main
+        with:
+          determinate: false
+
+      - name: Sync nix npmDepsHash
+        run: uv run python -m openplot.nix_hash_sync
+
       - name: Install frontend dependencies
         run: npm ci --prefix frontend
 
@@ -140,6 +148,9 @@ jobs:
 
       - name: Check version consistency
         run: uv run python -m openplot.release_versioning --check
+
+      - name: Build Nix package
+        run: nix build .#openplot --no-link
 
       - name: Guard tracked working tree changes
         run: |
