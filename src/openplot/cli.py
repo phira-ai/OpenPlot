@@ -9,7 +9,33 @@ from pathlib import Path
 import click
 import uvicorn
 
+from . import __version__
+
 DEFAULT_SERVE_PORT = 17623
+
+
+def _show_update_notice() -> None:
+    try:
+        from .server import _build_update_status_payload
+
+        payload = _build_update_status_payload(allow_network=True)
+    except Exception:
+        return
+
+    if payload.get("update_available") is not True:
+        return
+
+    latest_version = str(payload.get("latest_version") or "").strip()
+    if not latest_version:
+        return
+
+    latest_release_url = str(payload.get("latest_release_url") or "").strip()
+    if not latest_release_url:
+        return
+
+    click.echo(
+        f"Update available: OpenPlot {latest_version} (current {__version__}) - {latest_release_url}"
+    )
 
 
 @click.group()
@@ -35,6 +61,8 @@ def serve(file: str | None, port: int, host: str, no_browser: bool) -> None:
     If FILE is omitted, OpenPlot restores the most recently updated workspace.
     If no workspace exists, OpenPlot starts in plot mode.
     """
+    _show_update_notice()
+
     from .server import (
         create_app,
         init_session_from_script,
@@ -104,6 +132,8 @@ def serve(file: str | None, port: int, host: str, no_browser: bool) -> None:
 @click.option("--host", "-h", default="127.0.0.1", help="Host to bind to.")
 def desktop(file: str | None, port: int, host: str) -> None:
     """Launch OpenPlot in a native desktop window."""
+    _show_update_notice()
+
     from .desktop import launch_desktop
 
     launch_desktop(file, host=host, port=port)

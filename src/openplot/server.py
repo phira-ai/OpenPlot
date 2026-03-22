@@ -170,6 +170,13 @@ _codex_models_cache_ttl_s: float = 30.0
 _claude_models_cache: list[OpencodeModelOption] | None = None
 _claude_models_cache_expires_at: float = 0.0
 _claude_models_cache_ttl_s: float = 30.0
+_update_status_cache: dict[str, object] | None = None
+_update_status_cache_expires_at: float = 0.0
+_update_status_cache_ttl_s: float = 900.0
+_latest_release_api_url = (
+    "https://api.github.com/repos/phira-ai/OpenPlot/releases/latest"
+)
+_latest_release_page_url = "https://github.com/phira-ai/OpenPlot/releases/latest"
 _preferences_file_name = "preferences.json"
 _python_interpreter_preference_key = "python_interpreter"
 _plot_mode_generated_script_name = "openplot_generated.py"
@@ -1167,6 +1174,147 @@ def _read_url_bytes(url: str, *, headers: Mapping[str, str] | None = None) -> by
             stdout = fallback.stdout.decode("utf-8", errors="replace").strip()
             raise RuntimeError(stderr or stdout or f"Failed to download {url}") from exc
         return fallback.stdout
+
+
+def _parse_semver_parts(value: object) -> tuple[int, int, int] | None:
+    if not isinstance(value, str):
+        return None
+    match = re.fullmatch(r"v?(0|[1-9]\d*)\.(0|[1-9]\d*)\.(0|[1-9]\d*)", value.strip())
+    if match is None:
+        return None
+    major, minor, patch = match.groups()
+    return int(major), int(minor), int(patch)
+
+
+def _normalize_release_version(value: object) -> str | None:
+    parts = _parse_semver_parts(value)
+    if parts is None:
+        return None
+    return f"{parts[0]}.{parts[1]}.{parts[2]}"
+
+
+def _fetch_latest_release_payload() -> dict[str, object]:
+    payload = json.loads(
+        _read_url_bytes(
+            _latest_release_api_url,
+            headers={"Accept": "application/vnd.github+json"},
+        ).decode("utf-8")
+    )
+    if not isinstance(payload, dict):
+        raise RuntimeError("GitHub release payload was not an object")
+    return payload
+
+
+def _default_update_status_payload() -> dict[str, object]:
+    return {
+        "current_version": __version__,
+        "latest_version": None,
+        "latest_release_url": _latest_release_page_url,
+        "update_available": False,
+        "checked_at": None,
+        "error": None,
+    }
+
+
+def _update_status_cache_path() -> Path:
+    root = _state_root()
+    root.mkdir(parents=True, exist_ok=True)
+    return root / "update-status.json"
+
+
+def _load_update_status_disk_cache(*, require_fresh: bool) -> dict[str, object] | None:
+    path = _update_status_cache_path()
+    if not path.exists():
+        return None
+    if (
+        require_fresh
+        and time.time() - path.stat().st_mtime >= _update_status_cache_ttl_s
+    ):
+        return None
+    try:
+        payload = json.loads(_read_file_text(path))
+    except (OSError, json.JSONDecodeError):
+        return None
+    if not isinstance(payload, dict):
+        return None
+    return payload
+
+
+def _store_update_status_cache(payload: Mapping[str, object]) -> None:
+    global _update_status_cache, _update_status_cache_expires_at
+
+    cached = dict(payload)
+    _update_status_cache = cached
+    _update_status_cache_expires_at = time.monotonic() + _update_status_cache_ttl_s
+    try:
+        _update_status_cache_path().write_text(json.dumps(cached), encoding="utf-8")
+    except OSError:
+        pass
+
+
+def _build_update_status_payload(
+    *, force_refresh: bool = False, allow_network: bool = True
+) -> dict[str, object]:
+    global _update_status_cache, _update_status_cache_expires_at
+
+    now = time.monotonic()
+    if (
+        not force_refresh
+        and _update_status_cache is not None
+        and now < _update_status_cache_expires_at
+    ):
+        return dict(_update_status_cache)
+
+    if not force_refresh:
+        disk_cached = _load_update_status_disk_cache(require_fresh=True)
+        if disk_cached is not None:
+            _update_status_cache = dict(disk_cached)
+            _update_status_cache_expires_at = now + _update_status_cache_ttl_s
+            return dict(disk_cached)
+
+    stale_cached = (
+        None if force_refresh else _load_update_status_disk_cache(require_fresh=False)
+    )
+    if not allow_network:
+        if stale_cached is not None:
+            return dict(stale_cached)
+        return _default_update_status_payload()
+
+    checked_at = _now_iso()
+    payload: dict[str, object] = _default_update_status_payload()
+    payload["checked_at"] = checked_at
+
+    try:
+        release = _fetch_latest_release_payload()
+        if release.get("draft") is True or release.get("prerelease") is True:
+            raise RuntimeError("No stable GitHub release is currently published")
+
+        latest_version = _normalize_release_version(release.get("tag_name"))
+        if latest_version is None:
+            latest_version = _normalize_release_version(release.get("name"))
+        if latest_version is None:
+            raise RuntimeError(
+                "Latest GitHub release did not expose a semantic version"
+            )
+
+        release_url = release.get("html_url")
+        if isinstance(release_url, str) and release_url.startswith(
+            ("https://", "http://")
+        ):
+            payload["latest_release_url"] = release_url
+
+        current_parts = _parse_semver_parts(__version__)
+        latest_parts = _parse_semver_parts(latest_version)
+        if current_parts is None or latest_parts is None:
+            raise RuntimeError("Could not compare semantic versions")
+
+        payload["latest_version"] = latest_version
+        payload["update_available"] = latest_parts > current_parts
+    except Exception as exc:
+        payload["error"] = str(exc) or "Failed to check for updates"
+
+    _store_update_status_cache(payload)
+    return dict(payload)
 
 
 def _install_codex_release(job_id: str) -> dict[str, object]:
@@ -7926,6 +8074,7 @@ def _bootstrap_payload(
         "sessions": _list_session_summaries(),
         "active_session_id": active_session_id,
         "active_workspace_id": active_workspace_id,
+        "update_status": _build_update_status_payload(allow_network=False),
     }
 
 
@@ -10956,6 +11105,12 @@ def _register_routes(app: FastAPI) -> None:
             )
         await asyncio.to_thread(webbrowser.open, url)
         return {"status": "ok"}
+
+    @app.post("/api/update-status/refresh")
+    async def refresh_update_status():
+        return await asyncio.to_thread(
+            lambda: _build_update_status_payload(force_refresh=True)
+        )
 
     @app.get("/api/python/interpreter")
     async def get_python_interpreter(session_id: str | None = None):

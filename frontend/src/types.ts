@@ -338,6 +338,16 @@ export interface BootstrapState {
   sessions?: SessionSummary[];
   active_session_id?: string | null;
   active_workspace_id?: string | null;
+  update_status?: UpdateStatusState | null;
+}
+
+export interface UpdateStatusState {
+  current_version: string;
+  latest_version: string | null;
+  latest_release_url: string;
+  update_available: boolean;
+  checked_at: string | null;
+  error: string | null;
 }
 
 export interface RunnerAvailabilityState {
