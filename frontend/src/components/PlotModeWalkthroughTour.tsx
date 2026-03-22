@@ -1,5 +1,5 @@
-import { useEffect, useMemo, useState, type CSSProperties } from "react";
-import { ArrowLeft, ArrowRight, CircleHelp, X } from "lucide-react";
+import { useEffect, useMemo, useState, type CSSProperties, type ReactNode } from "react";
+import { ArrowLeft, ArrowRight, Bot, CircleHelp, X, Zap } from "lucide-react";
 
 import { Button } from "@/components/ui/button";
 import {
@@ -18,9 +18,10 @@ interface PlotModeWalkthroughTourProps {
 interface WalkthroughStep {
   target: string;
   title: string;
-  description: string;
-  tip: string;
+  description: ReactNode;
+  tip: ReactNode;
   panelSide?: "auto" | "left" | "right" | "top" | "bottom";
+  panelOffsetY?: number;
 }
 
 const WALKTHROUGH_STEPS: WalkthroughStep[] = [
@@ -62,6 +63,23 @@ const WALKTHROUGH_STEPS: WalkthroughStep[] = [
       "This panel shows the full drafting conversation, status updates, questions, and table previews from OpenPlot.",
     tip: "Answer pending questions directly in-line to unblock the next draft.",
     panelSide: "left",
+  },
+  {
+    target: "plot-mode-mode-switch",
+    title: "Quick vs auto mode",
+    description: (
+      <>
+        <span className="inline-flex items-center gap-1">
+          <Zap className="h-3.5 w-3.5" />
+          Quick mode
+        </span>{" "}
+        for fast visualization. <span className="inline-flex items-center gap-1"><Bot className="h-3.5 w-3.5" />Auto mode</span>{" "}
+        lets the agent self-iterate toward the final result.
+      </>
+    ),
+    tip: "Use Quick when exploring. Use Auto when the goal is clear.",
+    panelSide: "left",
+    panelOffsetY: -88,
   },
   {
     target: "plot-mode-composer",
@@ -347,11 +365,15 @@ export default function PlotModeWalkthroughTour({
       );
     }
 
+    const offsetY = currentStep.panelOffsetY ?? 0;
+
     return {
       panelStyle: {
         width: panelWidth,
         left: Math.round(panelLeft),
-        top: Math.round(panelTop),
+        top: Math.round(
+          clamp(panelTop + offsetY, 12, Math.max(viewportHeight - panelHeightEstimate - 12, 12)),
+        ),
       } satisfies CSSProperties,
       highlightStyle: {
         left: highlightLeft,
@@ -362,7 +384,7 @@ export default function PlotModeWalkthroughTour({
         boxShadow: "0 0 0 9999px rgba(6, 10, 16, 0.55)",
       } satisfies CSSProperties,
     };
-  }, [currentStep.panelSide, targetRect]);
+  }, [currentStep.panelOffsetY, currentStep.panelSide, targetRect]);
 
   return (
     <div className="fixed inset-0 z-[80]">

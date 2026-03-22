@@ -14,6 +14,7 @@ export interface PlotModeWorkspaceUpdateParams {
 
 export interface PlotComposerRevealParams {
   desktopViewport: boolean;
+  forceVisible?: boolean;
   hasHistory: boolean;
   hasMessage: boolean;
   isFocused: boolean;
@@ -103,6 +104,7 @@ export function shouldApplyPlotModeWorkspaceUpdate({
 
 export function shouldRevealPlotComposer({
   desktopViewport,
+  forceVisible = false,
   hasHistory,
   hasMessage,
   isFocused,
@@ -111,6 +113,9 @@ export function shouldRevealPlotComposer({
   isSending,
   touchInput,
 }: PlotComposerRevealParams): boolean {
+  if (forceVisible) {
+    return true;
+  }
   if (!desktopViewport || touchInput) {
     return true;
   }

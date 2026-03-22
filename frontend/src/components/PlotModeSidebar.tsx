@@ -107,6 +107,7 @@ interface PlotModeSidebarProps {
   ) => Promise<void>;
   onSendMessage: (message: string) => Promise<void>;
   onShowError: (message: string) => void;
+  walkthroughFocusedTarget?: string | null;
   plotModeExecutionMode: PlotModeExecutionMode;
   onChangePlotModeExecutionMode: (mode: PlotModeExecutionMode) => Promise<void> | void;
   onAnswerQuestion: (
@@ -677,6 +678,7 @@ export default function PlotModeSidebar({
   onSubmitTabularHint,
   onSendMessage,
   onShowError,
+  walkthroughFocusedTarget,
   plotModeExecutionMode,
   onChangePlotModeExecutionMode,
   onAnswerQuestion,
@@ -743,8 +745,13 @@ export default function PlotModeSidebar({
     requiresTabularHint ||
     Boolean(state?.pending_question_set);
   const canSubmitMessage = Boolean(message.trim()) && !requiresInitialFiles && !composerDisabled;
+  const walkthroughNeedsComposer =
+    walkthroughFocusedTarget === "plot-mode-mode-switch" ||
+    walkthroughFocusedTarget === "plot-mode-composer" ||
+    walkthroughFocusedTarget === "plot-mode-sources";
   const showComposer = shouldRevealPlotComposer({
     desktopViewport,
+    forceVisible: walkthroughNeedsComposer,
     hasHistory: hasChatHistory,
     hasMessage: Boolean(message.trim()),
     isFocused: composerFocused,
@@ -1383,6 +1390,7 @@ export default function PlotModeSidebar({
                     <div className="flex items-center gap-2">
                       <Button
                         type="button"
+                        data-walkthrough="plot-mode-mode-switch"
                         variant="outline"
                         size="icon-sm"
                         className="rounded-full border-white/45 bg-[linear-gradient(180deg,rgba(255,255,255,0.44),rgba(255,255,255,0.24))] shadow-[inset_0_1px_0_rgba(255,255,255,0.84),0_8px_18px_rgba(148,163,184,0.14)]"
@@ -1513,6 +1521,7 @@ export default function PlotModeSidebar({
                 <div className="flex items-center gap-2">
                   <Button
                     type="button"
+                    data-walkthrough="plot-mode-mode-switch"
                     variant="outline"
                     size="icon-sm"
                     className="rounded-full border-white/45 bg-[linear-gradient(180deg,rgba(255,255,255,0.44),rgba(255,255,255,0.24))] shadow-[inset_0_1px_0_rgba(255,255,255,0.84),0_8px_18px_rgba(148,163,184,0.14)]"

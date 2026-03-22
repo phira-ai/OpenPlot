@@ -156,6 +156,7 @@ describe("shouldRevealPlotComposer", () => {
     expect(
       shouldRevealPlotComposer({
         desktopViewport: true,
+        forceVisible: false,
         hasHistory: true,
         hasMessage: false,
         isFocused: true,
@@ -169,6 +170,7 @@ describe("shouldRevealPlotComposer", () => {
     expect(
       shouldRevealPlotComposer({
         desktopViewport: true,
+        forceVisible: false,
         hasHistory: true,
         hasMessage: false,
         isFocused: false,
@@ -184,6 +186,7 @@ describe("shouldRevealPlotComposer", () => {
     expect(
       shouldRevealPlotComposer({
         desktopViewport: false,
+        forceVisible: false,
         hasHistory: true,
         hasMessage: false,
         isFocused: false,
@@ -199,7 +202,24 @@ describe("shouldRevealPlotComposer", () => {
     expect(
       shouldRevealPlotComposer({
         desktopViewport: true,
+        forceVisible: false,
         hasHistory: false,
+        hasMessage: false,
+        isFocused: false,
+        isHovered: false,
+        isNearRevealZone: false,
+        isSending: false,
+        touchInput: false,
+      }),
+    ).toBe(true);
+  });
+
+  it("forces the composer open for walkthrough steps inside the prompt pill", () => {
+    expect(
+      shouldRevealPlotComposer({
+        desktopViewport: true,
+        forceVisible: true,
+        hasHistory: true,
         hasMessage: false,
         isFocused: false,
         isHovered: false,

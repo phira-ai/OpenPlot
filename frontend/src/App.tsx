@@ -1416,6 +1416,7 @@ function App() {
                       onSubmitTabularHint={handleSubmitTabularHint}
                       onSendMessage={handleSendPlotMessage}
                       onShowError={enqueueErrorNotification}
+                      walkthroughFocusedTarget={walkthroughFocusedTarget}
                       plotModeExecutionMode={plotMode?.execution_mode ?? "quick"}
                       onChangePlotModeExecutionMode={handleSetPlotExecutionMode}
                       onAnswerQuestion={handleAnswerPlotQuestion}
@@ -1451,6 +1452,7 @@ function App() {
                 onSubmitTabularHint={handleSubmitTabularHint}
                 onSendMessage={handleSendPlotMessage}
                 onShowError={enqueueErrorNotification}
+                walkthroughFocusedTarget={walkthroughFocusedTarget}
                 plotModeExecutionMode={plotMode?.execution_mode ?? "quick"}
                 onChangePlotModeExecutionMode={handleSetPlotExecutionMode}
                 onAnswerQuestion={handleAnswerPlotQuestion}
