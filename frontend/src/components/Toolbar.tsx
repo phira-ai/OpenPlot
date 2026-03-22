@@ -1,31 +1,23 @@
-import { useEffect, useMemo, useState } from "react";
-import {
-  CheckCircle2,
-  CircleOff,
-  Download,
-  Link as LinkIcon,
-  RefreshCw,
-  RotateCcw,
-  Save,
-  X,
-} from "lucide-react";
+import { useState } from "react";
+import { Settings2 } from "lucide-react";
+
 import type {
   Branch,
   FixRunner,
   OpencodeModelOption,
   PythonInterpreterMode,
   PythonInterpreterState,
+  RunnerStatusEntry,
+  RunnerStatusState,
+  UpdateStatusState,
 } from "../types";
-import { Badge } from "@/components/ui/badge";
+import SettingsDialog from "./SettingsDialog";
 import { Button } from "@/components/ui/button";
-import { Card, CardContent, CardDescription, CardHeader, CardTitle } from "@/components/ui/card";
-import { Input } from "@/components/ui/input";
 import { runnerLabel } from "@/lib/runners";
 import openplotLogo from "../../openplot.png";
 import codexLogo from "../../codex.svg";
 import claudeCodeLogo from "../../claude-code.svg";
 import opencodeLogo from "../../opencode.svg";
-import pythonLogo from "../../python.svg";
 
 function runnerLogo(runner: FixRunner): string {
   if (runner === "codex") {
@@ -65,13 +57,19 @@ interface ToolbarProps {
     mode: PythonInterpreterMode,
     path?: string,
   ) => Promise<void> | void;
-  onOpenRunnerManager?: () => void;
+  runnerStatus: RunnerStatusState | null;
+  runnerStatusLoading: boolean;
+  runnerStatusError: string | null;
+  onInstallRunner: (runner: RunnerStatusEntry["runner"]) => Promise<void> | void;
+  onAuthenticateRunner: (entry: RunnerStatusEntry) => Promise<void> | void;
+  onOpenRunnerGuide: (url: string) => Promise<void> | void;
+  onRefreshRunners: () => Promise<void> | void;
+  updateStatus: UpdateStatusState | null;
+  updateStatusLoading: boolean;
+  onRefreshUpdateStatus: () => Promise<UpdateStatusState | void> | void;
+  onOpenReleasePage: (url: string) => Promise<void> | void;
 }
 
-/**
- * Top toolbar — shows connection status and action buttons.
- * Annotations are created via region drawing for all plot types.
- */
 export default function Toolbar({
   mode,
   connected,
@@ -97,117 +95,21 @@ export default function Toolbar({
   pythonInterpreterError,
   onRefreshPythonInterpreter,
   onSavePythonInterpreter,
-  onOpenRunnerManager,
+  runnerStatus,
+  runnerStatusLoading,
+  runnerStatusError,
+  onInstallRunner,
+  onAuthenticateRunner,
+  onOpenRunnerGuide,
+  onRefreshRunners,
+  updateStatus,
+  updateStatusLoading,
+  onRefreshUpdateStatus,
+  onOpenReleasePage,
 }: ToolbarProps) {
-  const [showConnectionInfo, setShowConnectionInfo] = useState(false);
-  const [showInterpreterConfig, setShowInterpreterConfig] = useState(false);
-  const [interpreterModeDraft, setInterpreterModeDraft] = useState<PythonInterpreterMode>("builtin");
-  const [manualPathDraft, setManualPathDraft] = useState("");
-  const [isSavingInterpreter, setIsSavingInterpreter] = useState(false);
-  const [interpreterActionError, setInterpreterActionError] = useState<string | null>(null);
-
-  const branchList = useMemo(() => branches ?? [], [branches]);
-
-  const formattedLastConnectedAt = useMemo(
-    () =>
-      lastConnectedAt
-        ? new Date(lastConnectedAt).toLocaleString()
-        : "No successful connection yet",
-    [lastConnectedAt],
-  );
-
-  const formattedLastDisconnectedAt = useMemo(
-    () =>
-      lastDisconnectedAt
-        ? new Date(lastDisconnectedAt).toLocaleString()
-        : "No disconnections recorded",
-    [lastDisconnectedAt],
-  );
-
-  const activeBranchName = useMemo(
-    () => branchList.find((branch) => branch.id === activeBranchId)?.name ?? "Unknown",
-    [activeBranchId, branchList],
-  );
-
-  const selectedModelOption = useMemo(
-    () => opencodeModels.find((option) => option.id === selectedModel) ?? null,
-    [opencodeModels, selectedModel],
-  );
-
-  const availableVariants = useMemo(
-    () => selectedModelOption?.variants ?? [],
-    [selectedModelOption],
-  );
-
-  const resolvedInterpreterSummary = useMemo(() => {
-    if (!pythonInterpreterState) {
-      return "Interpreter unavailable";
-    }
-    const version = pythonInterpreterState.resolved_version || "unknown";
-    return `Python ${version}`;
-  }, [pythonInterpreterState]);
-
-  const availablePackages = useMemo(
-    () => pythonInterpreterState?.available_packages ?? [],
-    [pythonInterpreterState],
-  );
-
-  const runtimeSourceLabel = useMemo(() => {
-    const source = pythonInterpreterState?.resolved_source || "";
-    if (source === "manual") {
-      return "manual path";
-    }
-    if (source === "built-in") {
-      return "default runtime";
-    }
-    return source || "unknown source";
-  }, [pythonInterpreterState]);
-
-  useEffect(() => {
-    if (!showInterpreterConfig) {
-      return;
-    }
-    setInterpreterModeDraft(pythonInterpreterState?.mode ?? "builtin");
-    setManualPathDraft(pythonInterpreterState?.configured_path ?? "");
-    setInterpreterActionError(null);
-  }, [pythonInterpreterState, showInterpreterConfig]);
-
-  const openInterpreterConfig = () => {
-    setShowInterpreterConfig(true);
-    setInterpreterActionError(null);
-    void Promise.resolve(onRefreshPythonInterpreter()).catch(() => {
-      // Errors are surfaced via pythonInterpreterError.
-    });
-  };
-
-  const closeInterpreterConfig = () => {
-    if (isSavingInterpreter) {
-      return;
-    }
-    setShowInterpreterConfig(false);
-    setInterpreterActionError(null);
-  };
-
-  const handleSaveInterpreter = async () => {
-    if (interpreterModeDraft === "manual" && !manualPathDraft.trim()) {
-      setInterpreterActionError("Please enter a Python executable path.");
-      return;
-    }
-
-    setIsSavingInterpreter(true);
-    setInterpreterActionError(null);
-
-    try {
-      await onSavePythonInterpreter(interpreterModeDraft, manualPathDraft);
-      await onRefreshPythonInterpreter();
-      setShowInterpreterConfig(false);
-    } catch (err) {
-      const message = err instanceof Error ? err.message : "Failed to save interpreter setting";
-      setInterpreterActionError(message);
-    } finally {
-      setIsSavingInterpreter(false);
-    }
-  };
+  const [showSettings, setShowSettings] = useState(false);
+  const availableVariants = opencodeModels.find((option) => option.id === selectedModel)?.variants ?? [];
+  const updateAvailable = updateStatus?.update_available === true;
 
   return (
     <>
@@ -299,48 +201,23 @@ export default function Toolbar({
             </select>
           </div>
 
-            <Button
-              type="button"
-              variant="outline"
-              size="sm"
-              onClick={onOpenRunnerManager}
-              disabled={!onOpenRunnerManager}
-              className="gap-1.5 border-foreground/20 bg-foreground/[0.03] text-foreground"
-            >
-            <Download className="h-3.5 w-3.5" />
-            Runners
-          </Button>
-
           <Button
             type="button"
             variant="outline"
             size="sm"
-            onClick={() => setShowConnectionInfo(true)}
-            className={
-              connected
-                ? "gap-1.5 border-foreground/20 bg-foreground/[0.03] text-foreground"
-                : "gap-1.5 border-destructive/35 bg-destructive/10 text-destructive"
-            }
+            onClick={() => setShowSettings(true)}
+            className="relative h-9 w-9 border-foreground/20 bg-foreground/[0.03] p-0 text-foreground"
+            aria-label="Settings"
+            title="Settings"
           >
-            {connected ? (
-              <CheckCircle2 className="h-3.5 w-3.5" />
-            ) : (
-              <CircleOff className="h-3.5 w-3.5" />
-            )}
-            Live Sync
-          </Button>
-
-          <Button
-            type="button"
-            variant="outline"
-            size="sm"
-            onClick={openInterpreterConfig}
-            className="gap-1.5 border-foreground/20 bg-foreground/[0.03] text-foreground"
-            title={resolvedInterpreterSummary}
-            aria-label="Configure Python interpreter"
-          >
-            <img src={pythonLogo} alt="" className="h-3.5 w-3.5" aria-hidden="true" />
-            Python
+            <Settings2 className="h-3.5 w-3.5" />
+            {updateAvailable ? (
+              <span
+                data-testid="settings-update-dot"
+                aria-hidden="true"
+                className="absolute right-1.5 top-1.5 h-2 w-2 rounded-full bg-sky-500"
+              />
+            ) : null}
           </Button>
 
           {opencodeModelsError ? (
@@ -351,285 +228,35 @@ export default function Toolbar({
         </div>
       </header>
 
-      {showConnectionInfo && (
-        <div
-          className="fixed inset-0 z-50 flex items-center justify-center bg-black/30 p-4"
-          onClick={() => setShowConnectionInfo(false)}
-        >
-          <Card
-            className="w-full max-w-md border border-border/90 bg-popover shadow-xl"
-            onClick={(e) => e.stopPropagation()}
-          >
-            <CardHeader className="pb-3">
-              <div className="flex items-start justify-between gap-3">
-                <div>
-                  <CardTitle className="text-base">Connection Information</CardTitle>
-                  <CardDescription className="mt-1">
-                    Live WebSocket status for OpenPlot sync.
-                  </CardDescription>
-                </div>
-                <Button
-                  type="button"
-                  variant="ghost"
-                  size="icon-xs"
-                  onClick={() => setShowConnectionInfo(false)}
-                  aria-label="Close connection information"
-                >
-                  <X className="h-3.5 w-3.5" />
-                </Button>
-              </div>
-            </CardHeader>
-
-            <CardContent className="space-y-3 text-sm">
-              <div className="flex items-center justify-between">
-                <span className="text-muted-foreground">Status</span>
-                <Badge
-                  variant="secondary"
-                  className={
-                    connected
-                      ? "bg-foreground/10 text-foreground"
-                      : "bg-destructive/10 text-destructive"
-                  }
-                >
-                  {connected ? "Connected" : "Disconnected"}
-                </Badge>
-              </div>
-
-              <div className="space-y-1">
-                <div className="flex items-center gap-1.5 text-muted-foreground">
-                  <LinkIcon className="h-3.5 w-3.5" />
-                  Endpoint
-                </div>
-                <code className="block rounded-md border border-border/80 bg-muted/40 px-2.5 py-2 font-mono text-xs text-foreground break-all">
-                  {wsUrl || "Unavailable"}
-                </code>
-              </div>
-
-              <div className="grid grid-cols-[auto_1fr] items-center gap-x-3 gap-y-1.5 text-xs">
-                <span className="text-muted-foreground">Mode</span>
-                <span className="text-right text-foreground">{mode}</span>
-
-                {mode === "annotation" ? (
-                  <>
-                    <span className="text-muted-foreground">Active branch</span>
-                    <span className="text-right text-foreground">{activeBranchName}</span>
-
-                    <span className="text-muted-foreground">Checked out</span>
-                    <span className="truncate text-right font-mono text-foreground">{checkedOutVersionId || "<none>"}</span>
-                  </>
-                ) : null}
-
-                <span className="inline-flex items-center gap-1.5 text-muted-foreground">
-                  <RotateCcw className="h-3.5 w-3.5" />
-                  Reconnect attempts
-                </span>
-                <span className="text-right font-medium text-foreground">{reconnectAttempts}</span>
-
-                <span className="text-muted-foreground">Last connected</span>
-                <span className="text-right text-foreground">{formattedLastConnectedAt}</span>
-
-                <span className="text-muted-foreground">Last disconnected</span>
-                <span className="text-right text-foreground">{formattedLastDisconnectedAt}</span>
-              </div>
-            </CardContent>
-          </Card>
-        </div>
-      )}
-
-      {showInterpreterConfig && (
-        <div
-          className="fixed inset-0 z-50 flex items-center justify-center bg-black/30 p-4"
-          onClick={closeInterpreterConfig}
-        >
-          <Card
-            className="w-full max-w-2xl border border-border/90 bg-popover shadow-xl"
-            onClick={(event) => event.stopPropagation()}
-          >
-            <CardHeader className="pb-3">
-              <div className="flex items-start justify-between gap-3">
-                <div>
-                  <CardTitle className="text-base">Python Runtime</CardTitle>
-                  <CardDescription className="mt-1">
-                    This runtime executes plotting scripts and annotation fixes.
-                  </CardDescription>
-                </div>
-                <div className="flex items-center gap-1.5">
-                  <Button
-                    type="button"
-                    variant="outline"
-                    size="sm"
-                    onClick={() => {
-                      void Promise.resolve(onRefreshPythonInterpreter()).catch(() => {
-                        // Surface backend errors through the shared error state.
-                      });
-                    }}
-                    disabled={pythonInterpreterLoading || isSavingInterpreter}
-                    className="gap-1.5"
-                  >
-                    <RefreshCw className="h-3.5 w-3.5" />
-                    Refresh
-                  </Button>
-                  <Button
-                    type="button"
-                    variant="ghost"
-                    size="icon-xs"
-                    onClick={closeInterpreterConfig}
-                    aria-label="Close Python interpreter configuration"
-                  >
-                    <X className="h-3.5 w-3.5" />
-                  </Button>
-                </div>
-              </div>
-            </CardHeader>
-
-            <CardContent className="space-y-4 text-sm">
-              {pythonInterpreterError ? (
-                <div className="rounded-md border border-destructive/40 bg-destructive/10 px-3 py-2 text-xs text-destructive">
-                  {pythonInterpreterError}
-                </div>
-              ) : null}
-
-              <div className="space-y-2">
-                <p className="text-xs font-semibold uppercase tracking-[0.12em] text-muted-foreground">
-                  Runtime Selection
-                </p>
-                <div className="flex flex-wrap items-center gap-2">
-                  <Button
-                    type="button"
-                    variant={interpreterModeDraft === "builtin" ? "default" : "outline"}
-                    size="sm"
-                    onClick={() => setInterpreterModeDraft("builtin")}
-                    disabled={isSavingInterpreter}
-                  >
-                    Default runtime
-                  </Button>
-                  <Button
-                    type="button"
-                    variant={interpreterModeDraft === "manual" ? "default" : "outline"}
-                    size="sm"
-                    onClick={() => setInterpreterModeDraft("manual")}
-                    disabled={isSavingInterpreter}
-                  >
-                    Manual path
-                  </Button>
-                </div>
-                <p className="text-xs text-muted-foreground">
-                  Default runtime path: {pythonInterpreterState?.default_path || "Unavailable"}
-                </p>
-              </div>
-
-              {interpreterModeDraft === "manual" ? (
-                <label className="block space-y-1.5">
-                  <span className="text-xs text-muted-foreground">Python executable path</span>
-                  <Input
-                    value={manualPathDraft}
-                    onChange={(event) => setManualPathDraft(event.target.value)}
-                    placeholder="/usr/bin/python3"
-                    disabled={isSavingInterpreter}
-                  />
-                </label>
-              ) : null}
-
-              <div className="grid gap-3 md:grid-cols-2">
-                <div className="space-y-1.5 rounded-md border border-border/80 bg-muted/20 px-3 py-2">
-                  <p className="text-xs font-semibold text-foreground">Default runtime (built-in)</p>
-                  <p className="font-mono text-xs text-muted-foreground break-all">
-                    {pythonInterpreterState?.default_path || "Unavailable"}
-                  </p>
-                  <p className="text-xs text-muted-foreground">
-                    Python {pythonInterpreterState?.default_version || "unknown"}
-                  </p>
-                  {pythonInterpreterState?.default_package_probe_error ? (
-                    <p className="text-xs text-destructive">
-                      {pythonInterpreterState.default_package_probe_error}
-                    </p>
-                  ) : null}
-                </div>
-
-                <div className="space-y-1.5 rounded-md border border-border/80 bg-muted/20 px-3 py-2">
-                  <p className="text-xs font-semibold text-foreground">Runtime in use</p>
-                  <p className="font-mono text-xs text-muted-foreground break-all">
-                    {pythonInterpreterState?.resolved_path || "Unavailable"}
-                  </p>
-                  <p className="text-xs text-muted-foreground">
-                    Python {pythonInterpreterState?.resolved_version || "unknown"} · {runtimeSourceLabel}
-                  </p>
-                  {pythonInterpreterState?.configured_error ? (
-                    <p className="text-xs text-destructive">{pythonInterpreterState.configured_error}</p>
-                  ) : null}
-                  {pythonInterpreterState?.package_probe_error ? (
-                    <p className="text-xs text-destructive">{pythonInterpreterState.package_probe_error}</p>
-                  ) : null}
-                </div>
-              </div>
-
-              <div className="space-y-2 rounded-md border border-border/80 bg-muted/10 px-3 py-2">
-                <p className="text-xs font-semibold uppercase tracking-[0.12em] text-muted-foreground">
-                  Runtime package inventory
-                </p>
-                <div className="space-y-2 rounded-md border border-border/70 bg-background/60 px-2.5 py-2">
-                  <p className="text-[11px] font-semibold text-foreground">Runtime in use</p>
-                  <p className="text-xs text-muted-foreground">
-                    {pythonInterpreterState?.available_package_count ?? availablePackages.length} third-party package
-                    {(pythonInterpreterState?.available_package_count ?? availablePackages.length) === 1
-                      ? ""
-                      : "s"} detected.
-                  </p>
-                  {availablePackages.length > 0 ? (
-                    <div className="grid max-h-28 gap-1.5 overflow-y-auto sm:grid-cols-2">
-                      {availablePackages.map((pkg) => (
-                        <div
-                          key={`runtime-${pkg}`}
-                          className="rounded-md border border-border/70 bg-background/70 px-2 py-1 text-xs"
-                        >
-                          <span className="font-mono text-foreground">{pkg}</span>
-                        </div>
-                      ))}
-                    </div>
-                  ) : (
-                    <p className="text-xs text-muted-foreground">
-                      No third-party packages were detected for this runtime.
-                    </p>
-                  )}
-                </div>
-              </div>
-
-              {interpreterActionError ? (
-                <div className="rounded-md border border-destructive/40 bg-destructive/10 px-3 py-2 text-xs text-destructive">
-                  {interpreterActionError}
-                </div>
-              ) : null}
-
-              <div className="flex items-center justify-end gap-2">
-                <Button
-                  type="button"
-                  variant="outline"
-                  size="sm"
-                  onClick={closeInterpreterConfig}
-                  disabled={isSavingInterpreter}
-                >
-                  Cancel
-                </Button>
-                <Button
-                  type="button"
-                  size="sm"
-                  className="gap-1.5"
-                  onClick={() => {
-                    void handleSaveInterpreter();
-                  }}
-                  disabled={
-                    isSavingInterpreter ||
-                    (interpreterModeDraft === "manual" && !manualPathDraft.trim())
-                  }
-                >
-                  <Save className="h-3.5 w-3.5" />
-                  {isSavingInterpreter ? "Saving" : "Save"}
-                </Button>
-              </div>
-            </CardContent>
-          </Card>
-        </div>
-      )}
+      <SettingsDialog
+        open={showSettings}
+        onOpenChange={setShowSettings}
+        mode={mode}
+        branches={branches}
+        activeBranchId={activeBranchId}
+        checkedOutVersionId={checkedOutVersionId}
+        connected={connected}
+        wsUrl={wsUrl}
+        reconnectAttempts={reconnectAttempts}
+        lastConnectedAt={lastConnectedAt}
+        lastDisconnectedAt={lastDisconnectedAt}
+        runnerStatus={runnerStatus}
+        runnerStatusLoading={runnerStatusLoading}
+        runnerStatusError={runnerStatusError}
+        onInstallRunner={onInstallRunner}
+        onAuthenticateRunner={onAuthenticateRunner}
+        onOpenRunnerGuide={onOpenRunnerGuide}
+        onRefreshRunners={onRefreshRunners}
+        pythonInterpreterState={pythonInterpreterState}
+        pythonInterpreterLoading={pythonInterpreterLoading}
+        pythonInterpreterError={pythonInterpreterError}
+        onRefreshPythonInterpreter={onRefreshPythonInterpreter}
+        onSavePythonInterpreter={onSavePythonInterpreter}
+        updateStatus={updateStatus}
+        updateStatusLoading={updateStatusLoading}
+        onRefreshUpdateStatus={onRefreshUpdateStatus}
+        onOpenReleasePage={onOpenReleasePage}
+      />
     </>
   );
 }

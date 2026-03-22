@@ -21,6 +21,7 @@ import type {
   PythonInterpreterMode,
   PythonInterpreterState,
   RunnerStatusState,
+  UpdateStatusState,
 } from "../types";
 import { API_BASE, fetchJSON } from "../api/client";
 import { asErrorMessage } from "../lib/errors";
@@ -365,6 +366,8 @@ export function useSessionState() {
   );
   const [pythonInterpreterLoading, setPythonInterpreterLoading] = useState(true);
   const [pythonInterpreterError, setPythonInterpreterError] = useState<string | null>(null);
+  const [updateStatus, setUpdateStatus] = useState<UpdateStatusState | null>(null);
+  const [updateStatusLoading, setUpdateStatusLoading] = useState(false);
   const [fixJob, setFixJob] = useState<FixJob | null>(null);
   const [fixStepLogsByKey, setFixStepLogsByKey] = useState<Record<string, FixJobLogEvent[]>>({});
   const runnerModelsRequestIdRef = useRef(0);
@@ -400,6 +403,10 @@ export function useSessionState() {
       setActiveWorkspaceId(payload.plot_mode?.id ?? null);
     }
 
+    if ("update_status" in payload) {
+      setUpdateStatus(payload.update_status ?? null);
+    }
+
     if (payload.mode === "annotation") {
       setMode("annotation");
       setSession(payload.session ?? null);
@@ -414,6 +421,10 @@ export function useSessionState() {
   }, []);
 
   const applyBootstrapSummariesOnly = useCallback((payload: BootstrapState) => {
+    if ("update_status" in payload) {
+      setUpdateStatus(payload.update_status ?? null);
+    }
+
     if (Array.isArray(payload.sessions)) {
       setSessions(sortWorkspaceSummaries(payload.sessions.map(normalizeSessionSummary)));
       return;
@@ -543,6 +554,31 @@ export function useSessionState() {
       method: "POST",
       body: JSON.stringify({ url }),
     });
+  }, []);
+
+  const refreshUpdateStatus = useCallback(async () => {
+    setUpdateStatusLoading(true);
+    try {
+      const payload = await fetchJSON<UpdateStatusState>("/api/update-status/refresh", {
+        method: "POST",
+      });
+      setUpdateStatus(payload);
+      return payload;
+    } catch (err: unknown) {
+      const message = asErrorMessage(err, "Failed to check for updates");
+      setUpdateStatus((current) => ({
+        current_version: current?.current_version ?? "",
+        latest_version: current?.latest_version ?? null,
+        latest_release_url:
+          current?.latest_release_url ?? "https://github.com/phira-ai/OpenPlot/releases/latest",
+        update_available: current?.update_available ?? false,
+        checked_at: current?.checked_at ?? null,
+        error: message,
+      }));
+      throw err;
+    } finally {
+      setUpdateStatusLoading(false);
+    }
   }, []);
 
   const refreshRunnerModels = useCallback(async (runner: FixRunner) => {
@@ -1602,6 +1638,8 @@ export function useSessionState() {
     pythonInterpreter,
     pythonInterpreterLoading,
     pythonInterpreterError,
+    updateStatus,
+    updateStatusLoading,
     fixJob,
     fixStepLogsByKey,
     plotVersion,
@@ -1610,6 +1648,7 @@ export function useSessionState() {
     installRunner,
     launchRunnerAuth,
     openExternalUrl,
+    refreshUpdateStatus,
     refreshRunnerModels,
     refreshFixJob,
     refreshPythonInterpreter,
