@@ -16,6 +16,12 @@ from pathlib import Path
 import click
 import uvicorn
 
+from .services.runtime import (
+    get_shared_runtime,
+    set_runtime_workspace_dir,
+    write_runtime_port_file,
+)
+
 DEFAULT_DESKTOP_PORT = 17623
 _ALLOWED_SUFFIXES = {".py", ".svg", ".png", ".jpg", ".jpeg", ".pdf"}
 _DESKTOP_FILE_DROP_EVENT = "openplot-desktop-file-drop"
@@ -293,14 +299,14 @@ def launch_desktop(
     from openplot.server import (
         create_app,
         init_session_from_script,
-        set_workspace_dir,
-        write_port_file,
     )
 
+    runtime = get_shared_runtime()
+
     if file_path is None:
-        set_workspace_dir(Path.home())
+        set_runtime_workspace_dir(runtime, Path.home())
     else:
-        set_workspace_dir(file_path.parent)
+        set_runtime_workspace_dir(runtime, file_path.parent)
 
         click.echo(f"Executing {file_path.name} ...")
         result = init_session_from_script(file_path)
@@ -313,7 +319,7 @@ def launch_desktop(
     if port == 0:
         port = _pick_free_port()
 
-    write_port_file(port)
+    write_runtime_port_file(runtime, port)
     url = f"http://{host}:{port}"
 
     app = create_app()

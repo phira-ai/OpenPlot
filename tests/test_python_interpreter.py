@@ -6,6 +6,7 @@ from pathlib import Path
 from fastapi.testclient import TestClient
 
 import openplot.server as server
+from openplot.services.runtime import build_test_runtime, get_shared_runtime
 
 
 def _init_workspace(project_dir: Path) -> None:
@@ -17,6 +18,21 @@ def _make_manual_wrapper(path: Path) -> Path:
     wrapper.write_text(f'#!/bin/sh\n"{Path(sys.executable).resolve()}" "$@"\n')
     wrapper.chmod(0o755)
     return wrapper
+
+
+def test_set_workspace_dir_returns_resolved_path_and_updates_shared_workspace(
+    tmp_path: Path,
+) -> None:
+    project_dir = tmp_path / "nested" / "project"
+    project_dir.mkdir(parents=True)
+
+    previous = server._workspace_dir
+    try:
+        resolved = server.set_workspace_dir(project_dir / ".." / "project")
+        assert resolved == project_dir.resolve()
+        assert server._workspace_dir == project_dir.resolve()
+    finally:
+        server._workspace_dir = previous
 
 
 def test_python_interpreter_defaults_to_built_in_runtime(
@@ -145,3 +161,31 @@ def test_python_probe_supports_packaged_app_launcher(
     packages, package_error = server._probe_python_packages(launcher_path)
     assert package_error is None
     assert isinstance(packages, list)
+
+
+def test_python_interpreter_endpoint_uses_injected_runtime_state(
+    monkeypatch,
+    tmp_path: Path,
+) -> None:
+    monkeypatch.setenv("XDG_STATE_HOME", str(tmp_path / "state"))
+    runtime = build_test_runtime(store_root=tmp_path / "isolated-state")
+    shared_runtime = get_shared_runtime()
+
+    script_path = tmp_path / "workspace" / "plot.py"
+    script_path.parent.mkdir(parents=True, exist_ok=True)
+    script_path.write_text(
+        "import matplotlib\n"
+        "matplotlib.use('Agg')\n"
+        "import matplotlib.pyplot as plt\n"
+        "plt.plot([1], [1])\n"
+        "plt.savefig('plot.png')\n"
+    )
+    assert server.init_session_from_script(script_path, runtime=runtime).success
+    shared_runtime.store.active_session = None
+    shared_runtime.store.active_session_id = None
+
+    with TestClient(server.create_app(runtime=runtime)) as client:
+        response = client.get("/api/python/interpreter")
+
+    assert response.status_code == 200
+    assert response.json()["context_dir"] == str(script_path.parent.resolve())

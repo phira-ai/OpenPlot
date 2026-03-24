@@ -11,6 +11,11 @@ from fastapi.testclient import TestClient
 
 import openplot.server as server
 from openplot.models import AnnotationStatus, OpencodeModelOption
+from openplot.services.runtime import (
+    build_test_runtime,
+    build_update_status_payload,
+    get_shared_runtime,
+)
 
 
 def _script_code(*, color: str = "steelblue") -> str:
@@ -36,53 +41,6 @@ def _create_persisted_plot_workspace(workspace_dir: Path) -> server.PlotModeStat
 
 
 @pytest.fixture(autouse=True)
-def _reset_server_state():
-    prev_session = server._session
-    prev_sessions = dict(server._sessions)
-    prev_session_order = list(server._session_order)
-    prev_active_session_id = server._active_session_id
-    prev_plot_mode = server._plot_mode
-    prev_workspace = server._workspace_dir
-    prev_loaded_store_root = server._loaded_session_store_root
-    prev_fix_jobs = dict(server._fix_jobs)
-    prev_fix_job_tasks = dict(server._fix_job_tasks)
-    prev_fix_job_processes = dict(server._fix_job_processes)
-    prev_active_fix_jobs_by_session = dict(server._active_fix_job_ids_by_session)
-
-    server._session = None
-    server._sessions.clear()
-    server._session_order.clear()
-    server._active_session_id = None
-    server._plot_mode = None
-    server._loaded_session_store_root = None
-    server._fix_jobs.clear()
-    server._fix_job_tasks.clear()
-    server._fix_job_processes.clear()
-    server._active_fix_job_ids_by_session.clear()
-
-    try:
-        yield
-    finally:
-        server._session = prev_session
-        server._sessions.clear()
-        server._sessions.update(prev_sessions)
-        server._session_order.clear()
-        server._session_order.extend(prev_session_order)
-        server._active_session_id = prev_active_session_id
-        server._plot_mode = prev_plot_mode
-        server._workspace_dir = prev_workspace
-        server._loaded_session_store_root = prev_loaded_store_root
-        server._fix_jobs.clear()
-        server._fix_jobs.update(prev_fix_jobs)
-        server._fix_job_tasks.clear()
-        server._fix_job_tasks.update(prev_fix_job_tasks)
-        server._fix_job_processes.clear()
-        server._fix_job_processes.update(prev_fix_job_processes)
-        server._active_fix_job_ids_by_session.clear()
-        server._active_fix_job_ids_by_session.update(prev_active_fix_jobs_by_session)
-
-
-@pytest.fixture(autouse=True)
 def _stub_runner_availability(monkeypatch: pytest.MonkeyPatch) -> None:
     monkeypatch.setattr(
         server,
@@ -93,6 +51,398 @@ def _stub_runner_availability(monkeypatch: pytest.MonkeyPatch) -> None:
             "claude_code_available": False,
         },
     )
+
+
+def test_runtime_reset_fixture_starts_clean(backend_runtime_reset) -> None:
+    assert server._session is None
+    assert server._sessions == {}
+    assert server._session_order == []
+    assert server._active_session_id is None
+    assert server._plot_mode is None
+    assert server._workspace_dir == Path.cwd()
+    assert server._loaded_session_store_root is None
+    assert server._fix_jobs == {}
+    assert server._fix_job_tasks == {}
+    assert server._fix_job_processes == {}
+    assert server._active_fix_job_ids_by_session == {}
+
+
+def test_create_app_accepts_injected_runtime(tmp_path: Path) -> None:
+    runtime = build_test_runtime(store_root=tmp_path)
+
+    app = server.create_app(runtime=runtime)
+
+    assert app.state.runtime is runtime
+
+
+def test_bootstrap_reads_from_injected_runtime(tmp_path: Path) -> None:
+    runtime = build_test_runtime(store_root=tmp_path)
+    seeded_state = server.init_plot_mode_session(
+        workspace_dir=tmp_path / "seeded-workspace",
+        persist_workspace=False,
+    )
+    runtime.store.plot_mode = seeded_state
+    runtime.store.active_workspace_id = seeded_state.id
+
+    app = server.create_app(runtime=runtime)
+    app.state.runtime.store.plot_mode = seeded_state
+    app.state.runtime.store.active_workspace_id = seeded_state.id
+
+    server._plot_mode = server.init_plot_mode_session(
+        workspace_dir=tmp_path / "shared-workspace",
+        persist_workspace=False,
+    )
+
+    with TestClient(app) as client:
+        response = client.get("/api/bootstrap")
+
+    assert response.status_code == 200
+    payload = response.json()
+    assert payload["plot_mode"]["id"] == seeded_state.id
+    assert payload["active_workspace_id"] == seeded_state.id
+
+
+def test_injected_runtime_does_not_load_shared_persisted_state_by_default(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    shared_state_root = tmp_path / "shared-state"
+    isolated_state_root = tmp_path / "isolated-state"
+    monkeypatch.setenv("OPENPLOT_STATE_DIR", str(shared_state_root))
+
+    script_path = tmp_path / "workspace" / "shared.py"
+    script_path.parent.mkdir(parents=True, exist_ok=True)
+    script_path.write_text(_script_code(color="navy"))
+
+    result = server.init_session_from_script(script_path)
+    assert result.success
+    shared_session_id = server.get_session().id
+
+    runtime = build_test_runtime(store_root=isolated_state_root)
+
+    with TestClient(server.create_app(runtime=runtime)) as client:
+        response = client.get("/api/sessions")
+
+    assert response.status_code == 200
+    payload = response.json()
+    assert payload["sessions"] == []
+    assert payload["active_session_id"] is None
+    assert shared_session_id not in {entry["id"] for entry in payload["sessions"]}
+
+
+def test_sessions_endpoint_uses_injected_runtime_state(tmp_path: Path) -> None:
+    runtime = build_test_runtime(store_root=tmp_path / "isolated-state")
+    script_path = tmp_path / "plot.py"
+    script_path.write_text(_script_code(color="brown"))
+    result = server.init_session_from_script(script_path, runtime=runtime)
+    assert result.success
+    session = runtime.store.active_session
+    assert session is not None
+
+    shared_runtime = get_shared_runtime()
+    shared_runtime.store.sessions.clear()
+    shared_runtime.store.session_order.clear()
+    shared_runtime.store.active_session_id = None
+    shared_runtime.store.active_session = None
+
+    with TestClient(server.create_app(runtime=runtime)) as client:
+        response = client.get("/api/sessions")
+
+    assert response.status_code == 200
+    payload = response.json()
+    assert [
+        entry["session_id"]
+        for entry in payload["sessions"]
+        if entry["workspace_mode"] == "annotation"
+    ] == [session.id]
+    assert payload["active_session_id"] == session.id
+
+
+def test_runtime_cannot_be_reused_across_app_lifecycles(tmp_path: Path) -> None:
+    runtime = build_test_runtime(store_root=tmp_path)
+    app1 = server.create_app(runtime=runtime)
+    app2 = server.create_app(runtime=runtime)
+
+    with TestClient(app1):
+        with pytest.raises(RuntimeError):
+            with TestClient(app2):
+                pass
+
+
+def test_injected_runtime_does_not_share_update_or_model_caches(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    shared_runtime = get_shared_runtime()
+    injected_runtime = build_test_runtime(store_root=tmp_path)
+    shared_runtime.infra.update_status_cache = None
+    shared_runtime.infra.update_status_cache_expires_at = 0.0
+    shared_runtime.infra.opencode_models_cache = [
+        OpencodeModelOption(
+            id="shared-model",
+            provider="openai",
+            name="Shared Model",
+            variants=[],
+        )
+    ]
+    shared_runtime.infra.opencode_models_cache_expires_at = time.monotonic() + 60.0
+
+    payload = {
+        "tag_name": "v999.0.0",
+        "draft": False,
+        "prerelease": False,
+        "html_url": "https://example.com/releases/v999.0.0",
+    }
+    monkeypatch.setattr(server, "_fetch_latest_release_payload", lambda: payload)
+
+    injected_status = build_update_status_payload(
+        injected_runtime,
+        allow_network=True,
+    )
+
+    assert injected_status["latest_version"] == "999.0.0"
+    assert shared_runtime.infra.update_status_cache is None
+    assert [model.id for model in shared_runtime.infra.opencode_models_cache or []] == [
+        "shared-model"
+    ]
+
+
+def test_bootstrap_prefers_active_workspace_from_injected_runtime(
+    tmp_path: Path,
+) -> None:
+    runtime = build_test_runtime(store_root=tmp_path)
+    workspace = tmp_path / "workspace"
+    state = server.init_plot_mode_session(
+        workspace_dir=workspace,
+        persist_workspace=False,
+    )
+    runtime.store.plot_mode = state
+    runtime.store.active_workspace_id = state.id
+    server._plot_mode = None
+
+    with TestClient(server.create_app(runtime=runtime)) as client:
+        response = client.get("/api/bootstrap")
+
+    assert response.status_code == 200
+    payload = response.json()
+    assert payload["mode"] == "plot"
+    assert payload["active_workspace_id"] == state.id
+
+
+def test_injected_runtime_request_path_does_not_mutate_shared_runtime(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    monkeypatch.setenv("XDG_STATE_HOME", str(tmp_path / "state"))
+    runtime = build_test_runtime(store_root=tmp_path / "isolated-state")
+    shared_runtime = get_shared_runtime()
+    shared_runtime.store.sessions.clear()
+    shared_runtime.store.session_order.clear()
+    shared_runtime.store.active_session_id = None
+    shared_runtime.store.active_session = None
+
+    workspace = tmp_path / "workspace"
+    workspace.mkdir(parents=True, exist_ok=True)
+    script_path = workspace / "runtime-script.py"
+    script_path.write_text(_script_code(color="olive"))
+
+    state = server.init_plot_mode_session(
+        workspace_dir=workspace, persist_workspace=False
+    )
+    runtime.store.plot_mode = state
+    runtime.store.active_workspace_id = state.id
+
+    with TestClient(server.create_app(runtime=runtime)) as client:
+        response = client.post(
+            "/api/plot-mode/select-paths",
+            json={
+                "selection_type": "script",
+                "paths": [str(script_path)],
+                "workspace_id": state.id,
+            },
+        )
+
+        assert response.status_code == 200
+        assert runtime.store.active_session is not None
+        assert runtime.store.active_session.source_script_path == str(
+            script_path.resolve()
+        )
+
+    assert shared_runtime.store.sessions == {}
+    assert shared_runtime.store.active_session_id is None
+
+
+def test_injected_runtime_request_keeps_shared_workspace_dir_unchanged(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    monkeypatch.setenv("XDG_STATE_HOME", str(tmp_path / "state"))
+    runtime = build_test_runtime(store_root=tmp_path / "isolated-state")
+    shared_runtime = get_shared_runtime()
+
+    workspace = tmp_path / "workspace"
+    workspace.mkdir(parents=True, exist_ok=True)
+    script_path = workspace / "runtime-script.py"
+    script_path.write_text(_script_code(color="goldenrod"))
+
+    state = server.init_plot_mode_session(
+        workspace_dir=workspace, persist_workspace=False
+    )
+    runtime.store.plot_mode = state
+    runtime.store.active_workspace_id = state.id
+    shared_workspace_dir = tmp_path / "shared-workspace"
+    shared_runtime.store.workspace_dir = shared_workspace_dir
+
+    with TestClient(server.create_app(runtime=runtime)) as client:
+        response = client.post(
+            "/api/plot-mode/select-paths",
+            json={
+                "selection_type": "script",
+                "paths": [str(script_path)],
+                "workspace_id": state.id,
+            },
+        )
+        assert response.status_code == 200
+        assert runtime.store.workspace_dir == workspace.resolve()
+
+    assert shared_runtime.store.workspace_dir == shared_workspace_dir
+
+
+def test_injected_runtime_lifecycle_does_not_leave_shared_state_behind(
+    tmp_path: Path,
+) -> None:
+    runtime = build_test_runtime(store_root=tmp_path / "isolated-state")
+    shared_runtime = get_shared_runtime()
+    shared_runtime.store.workspace_dir = tmp_path / "shared-before"
+    shared_runtime.store.active_session_id = None
+    shared_runtime.store.active_session = None
+    server._workspace_dir = shared_runtime.store.workspace_dir
+    server._active_session_id = None
+    server._session = None
+
+    isolated_workspace = tmp_path / "isolated-workspace"
+    isolated_workspace.mkdir(parents=True, exist_ok=True)
+    runtime.store.workspace_dir = isolated_workspace
+
+    app = server.create_app(runtime=runtime)
+    with TestClient(app):
+        runtime.store.active_session_id = "isolated-session"
+        runtime.infra.lifecycle_owner_token is not None
+
+    assert shared_runtime.store.workspace_dir == tmp_path / "shared-before"
+    assert shared_runtime.store.active_session_id is None
+    assert server._workspace_dir == tmp_path / "shared-before"
+    assert server._active_session_id is None
+
+
+def test_injected_runtime_startup_failure_releases_lifecycle_lock(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    runtime = build_test_runtime(store_root=tmp_path / "isolated-state")
+    app = server.create_app(runtime=runtime)
+    calls = {"count": 0}
+    original = server._ensure_session_store_loaded
+
+    def flaky_loader(*, force_reload: bool = False) -> None:
+        calls["count"] += 1
+        if calls["count"] == 1:
+            raise RuntimeError("boom")
+        original(force_reload=force_reload)
+
+    monkeypatch.setattr(server, "_ensure_session_store_loaded", flaky_loader)
+
+    with pytest.raises(RuntimeError, match="boom"):
+        with TestClient(app):
+            pass
+
+    assert runtime.infra.lifecycle_owner_token is None
+
+    with TestClient(server.create_app(runtime=runtime)):
+        pass
+
+    assert runtime.infra.lifecycle_owner_token is None
+
+
+def test_injected_runtime_startup_hydrates_persisted_sessions(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    monkeypatch.setenv("XDG_STATE_HOME", str(tmp_path / "state"))
+    store_root = tmp_path / "shared-store"
+    runtime1 = build_test_runtime(store_root=store_root)
+    script_path = tmp_path / "workspace" / "persisted.py"
+    script_path.parent.mkdir(parents=True, exist_ok=True)
+    script_path.write_text(_script_code(color="indigo"))
+
+    result = server.init_session_from_script(script_path, runtime=runtime1)
+    assert result.success
+    session = runtime1.store.active_session
+    assert session is not None
+
+    runtime2 = build_test_runtime(store_root=store_root)
+
+    with TestClient(server.create_app(runtime=runtime2)) as client:
+        response = client.get("/api/sessions")
+
+    assert response.status_code == 200
+    payload = response.json()
+    assert payload["active_session_id"] == session.id
+    assert [
+        entry["session_id"]
+        for entry in payload["sessions"]
+        if entry["workspace_mode"] == "annotation"
+    ] == [session.id]
+
+
+def test_sessions_new_uses_injected_runtime_state(tmp_path: Path) -> None:
+    runtime = build_test_runtime(store_root=tmp_path / "isolated-state")
+    shared_runtime = get_shared_runtime()
+    shared_runtime.store.plot_mode = None
+    shared_runtime.store.active_workspace_id = None
+
+    with TestClient(server.create_app(runtime=runtime)) as client:
+        response = client.post("/api/sessions/new")
+        assert response.status_code == 200
+        assert runtime.store.plot_mode is not None
+        assert runtime.store.active_workspace_id == runtime.store.plot_mode.id
+
+    assert shared_runtime.store.plot_mode is None
+    assert shared_runtime.store.active_workspace_id is None
+
+
+def test_sessions_activate_uses_injected_runtime_state(tmp_path: Path) -> None:
+    runtime = build_test_runtime(store_root=tmp_path / "isolated-state")
+    shared_runtime = get_shared_runtime()
+
+    workspace = tmp_path / "workspace"
+    workspace.mkdir(parents=True, exist_ok=True)
+    script_a = workspace / "a.py"
+    script_b = workspace / "b.py"
+    script_a.write_text(_script_code(color="maroon"))
+    script_b.write_text(_script_code(color="cyan"))
+
+    assert server.init_session_from_script(script_a, runtime=runtime).success
+    first_session = runtime.store.active_session
+    assert first_session is not None
+    assert server.init_session_from_script(script_b, runtime=runtime).success
+    second_session = runtime.store.active_session
+    assert second_session is not None
+    assert second_session.id != first_session.id
+
+    shared_runtime.store.active_session_id = None
+    shared_runtime.store.active_session = None
+    shared_runtime.store.sessions.clear()
+
+    with TestClient(server.create_app(runtime=runtime)) as client:
+        response = client.post(f"/api/sessions/{first_session.id}/activate")
+        assert response.status_code == 200
+        assert runtime.store.active_session_id == first_session.id
+        assert runtime.store.active_session is not None
+        assert runtime.store.active_session.id == first_session.id
+
+    assert shared_runtime.store.active_session_id is None
+    assert shared_runtime.store.sessions == {}
 
 
 def test_sessions_sidebar_endpoints_activate_previous_session(
@@ -318,6 +668,63 @@ def test_bootstrap_restores_last_modified_workspace_across_modes(
         assert second_payload["session"] is not None
         assert second_payload["session"]["id"] == session_id
         assert second_payload["active_workspace_id"] == session_id
+
+
+def test_latest_workspace_restore_and_active_workspace_hydration_still_work(
+    monkeypatch,
+    tmp_path: Path,
+) -> None:
+    monkeypatch.setenv("XDG_STATE_HOME", str(tmp_path / "state"))
+
+    workspace = tmp_path / "workspace"
+    workspace.mkdir(parents=True, exist_ok=True)
+
+    script_a = workspace / "alpha.py"
+    script_b = workspace / "beta.py"
+    script_a.write_text(_script_code(color="navy"))
+    script_b.write_text(_script_code(color="crimson"))
+
+    first_result = server.init_session_from_script(script_a)
+    assert first_result.success
+    first_session_id = server.get_session().id
+
+    server.init_plot_mode_session(workspace_dir=workspace)
+
+    second_result = server.init_session_from_script(script_b)
+    assert second_result.success
+    second_session_id = server.get_session().id
+
+    with TestClient(server.create_app()) as client:
+        activate_resp = client.post(f"/api/sessions/{first_session_id}/activate")
+        assert activate_resp.status_code == 200
+
+    server._session = None
+    server._plot_mode = None
+    server._active_session_id = None
+    server._loaded_session_store_root = None
+
+    with TestClient(server.create_app()) as client:
+        bootstrap_response = client.get("/api/bootstrap")
+        active_session_response = client.get("/api/session")
+        sessions_response = client.get("/api/sessions")
+
+    assert bootstrap_response.status_code == 200
+    bootstrap_payload = bootstrap_response.json()
+    assert bootstrap_payload["mode"] == "annotation"
+    assert bootstrap_payload["session"]["id"] == first_session_id
+    assert bootstrap_payload["active_session_id"] == first_session_id
+    assert bootstrap_payload["active_workspace_id"] == first_session_id
+
+    assert active_session_response.status_code == 200
+    assert active_session_response.json()["id"] == first_session_id
+
+    assert sessions_response.status_code == 200
+    payload = sessions_response.json()
+    assert payload["active_session_id"] == first_session_id
+    assert {entry["id"] for entry in payload["sessions"]} == {
+        first_session_id,
+        second_session_id,
+    }
 
 
 def test_plot_endpoint_can_target_specific_workspace_version(

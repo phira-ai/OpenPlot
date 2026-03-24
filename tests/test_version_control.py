@@ -6,6 +6,9 @@ from pathlib import Path
 
 from fastapi.testclient import TestClient
 
+import openplot.server as server
+from openplot.models import FixJob
+from openplot.services.runtime import build_test_runtime, get_shared_runtime
 from openplot.server import create_app, init_session_from_script
 
 
@@ -233,6 +236,117 @@ def test_branch_name_can_be_edited(monkeypatch, tmp_path: Path) -> None:
             if branch["id"] == branch_id
         )
         assert restarted_branch["name"] == "contrast-pass"
+
+
+def test_branch_rename_updates_injected_runtime_fix_jobs_only(tmp_path: Path) -> None:
+    runtime = build_test_runtime(store_root=tmp_path / "isolated-state")
+    shared_runtime = get_shared_runtime()
+    shared_runtime.store.fix_jobs.clear()
+
+    script_path = tmp_path / "plot.py"
+    _write_script(script_path, color="steelblue")
+    assert init_session_from_script(script_path, runtime=runtime).success
+    session = runtime.store.active_session
+    assert session is not None
+    branch_id = session.active_branch_id
+    assert branch_id is not None
+
+    job = FixJob(
+        model="openai/gpt-5.3-codex",
+        session_id=session.id,
+        workspace_dir=str(tmp_path),
+        branch_id=branch_id,
+        branch_name="main",
+    )
+    runtime.store.fix_jobs[job.id] = job
+
+    with TestClient(server.create_app(runtime=runtime)) as client:
+        response = client.patch(
+            f"/api/branches/{branch_id}",
+            json={"name": "runtime-branch"},
+        )
+        assert response.status_code == 200
+        assert runtime.store.fix_jobs[job.id].branch_name == "runtime-branch"
+
+    assert shared_runtime.store.fix_jobs == {}
+
+
+def test_script_revision_checkout_and_branch_endpoints_round_trip(
+    monkeypatch,
+    tmp_path: Path,
+) -> None:
+    monkeypatch.setenv("XDG_STATE_HOME", str(tmp_path / "state"))
+
+    script_path = tmp_path / "plot.py"
+    _write_script(script_path, color="steelblue")
+
+    result = init_session_from_script(script_path)
+    assert result.success
+
+    with TestClient(create_app()) as client:
+        session0 = client.get("/api/session").json()
+        main_branch_id = session0["active_branch_id"]
+        root_version_id = session0["checked_out_version_id"]
+
+        add_resp = client.post(
+            "/api/annotations",
+            json={"feedback": "increase contrast", "region": _new_region()},
+        )
+        assert add_resp.status_code == 200
+        annotation_id = add_resp.json()["id"]
+
+        submit_resp = client.post(
+            "/api/script",
+            json={"code": _script_code(color="black"), "annotation_id": annotation_id},
+        )
+        assert submit_resp.status_code == 200
+        main_version_id = submit_resp.json()["version_id"]
+
+        revisions_resp = client.get("/api/revisions")
+        assert revisions_resp.status_code == 200
+        revisions = revisions_resp.json()
+        assert len(revisions) == 2
+        assert revisions[0]["script"] == _script_code(color="steelblue")
+        assert revisions[1]["script"] == _script_code(color="black")
+
+        checkout_root_resp = client.post(
+            "/api/checkout",
+            json={"version_id": root_version_id, "branch_id": main_branch_id},
+        )
+        assert checkout_root_resp.status_code == 200
+
+        branch_annotation_resp = client.post(
+            "/api/annotations",
+            json={"feedback": "use a red line", "region": _new_region()},
+        )
+        assert branch_annotation_resp.status_code == 200
+
+        branch_session = client.get("/api/session").json()
+        branch_id = branch_session["active_branch_id"]
+        assert branch_id != main_branch_id
+
+        rename_resp = client.patch(
+            f"/api/branches/{branch_id}",
+            json={"name": "contrast-pass"},
+        )
+        assert rename_resp.status_code == 200
+        assert rename_resp.json()["branch"]["name"] == "contrast-pass"
+
+        checkout_main_branch_resp = client.post(
+            f"/api/branches/{main_branch_id}/checkout"
+        )
+        assert checkout_main_branch_resp.status_code == 200
+        assert checkout_main_branch_resp.json()["branch_id"] == main_branch_id
+
+        refreshed_session = client.get("/api/session").json()
+        renamed_branch = next(
+            branch
+            for branch in refreshed_session["branches"]
+            if branch["id"] == branch_id
+        )
+        assert renamed_branch["name"] == "contrast-pass"
+        assert refreshed_session["active_branch_id"] == main_branch_id
+        assert refreshed_session["checked_out_version_id"] == main_version_id
 
 
 def test_annotation_status_is_system_managed(monkeypatch, tmp_path: Path) -> None:

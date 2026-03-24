@@ -10,6 +10,11 @@ import click
 import uvicorn
 
 from . import __version__
+from .services.runtime import (
+    get_shared_runtime,
+    set_runtime_workspace_dir,
+    write_runtime_port_file,
+)
 
 DEFAULT_SERVE_PORT = 17623
 
@@ -66,9 +71,9 @@ def serve(file: str | None, port: int, host: str, no_browser: bool) -> None:
     from .server import (
         create_app,
         init_session_from_script,
-        set_workspace_dir,
-        write_port_file,
     )
+
+    runtime = get_shared_runtime()
 
     if file is not None:
         file_path = Path(file).expanduser().resolve()
@@ -93,7 +98,7 @@ def serve(file: str | None, port: int, host: str, no_browser: bool) -> None:
             sys.exit(1)
         click.echo(f"Detected output: {result.plot_path} ({result.plot_type})")
     else:
-        set_workspace_dir(Path.cwd())
+        set_runtime_workspace_dir(runtime, Path.cwd())
         click.echo(
             "Starting OpenPlot. The web UI will restore the most recently updated workspace or start a new plot workspace."
         )
@@ -106,7 +111,7 @@ def serve(file: str | None, port: int, host: str, no_browser: bool) -> None:
             s.bind(("", 0))
             port = s.getsockname()[1]
 
-    write_port_file(port)
+    write_runtime_port_file(runtime, port)
 
     url = f"http://{host}:{port}"
     click.echo(f"OpenPlot server running at {url}")
