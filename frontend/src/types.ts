@@ -1,4 +1,7 @@
-/** Shared TypeScript types mirroring the Python Pydantic models. */
+/**
+ * Shared TypeScript types for backend-synced payloads and transport contracts.
+ * Keep UI-local view models and feature helper types near their owning frontend feature.
+ */
 
 export interface ElementInfo {
   tag: string;
@@ -150,6 +153,12 @@ export interface PlotModeQuestionSet {
   questions: PlotModeQuestionItem[];
 }
 
+export interface PlotModeQuestionAnswerInput {
+  question_id: string;
+  option_ids: string[];
+  text?: string | null;
+}
+
 export interface PlotModeInputBundle {
   id: string;
   label: string;
@@ -230,6 +239,14 @@ export interface PlotModeTabularSelectionRegion {
   sheet_id: string;
   sheet_name: string;
   bounds: PlotModeSheetBounds;
+}
+
+export interface PlotModeTabularHintRegionInput {
+  sheet_id: string;
+  row_start: number;
+  row_end: number;
+  col_start: number;
+  col_end: number;
 }
 
 export interface PlotModeDataRegion {

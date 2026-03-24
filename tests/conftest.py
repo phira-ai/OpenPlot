@@ -5,6 +5,7 @@ from pathlib import Path
 import pytest
 
 import openplot.server as server
+from openplot.services.runtime import BackendRuntime, build_test_runtime
 
 
 @pytest.fixture(autouse=True)
@@ -185,3 +186,35 @@ def backend_runtime_reset():
         shared_runtime.infra.lifecycle_owner_token = prev_shared_infra[
             "lifecycle_owner_token"
         ]
+
+
+@pytest.fixture
+def shared_runtime() -> BackendRuntime:
+    return server.get_shared_runtime()
+
+
+@pytest.fixture
+def test_runtime(tmp_path: Path) -> BackendRuntime:
+    return build_test_runtime(store_root=tmp_path / "isolated-state")
+
+
+@pytest.fixture
+def run_with_test_runtime(test_runtime: BackendRuntime):
+    def _run(callback):
+        return server._with_runtime(test_runtime, callback)
+
+    return _run
+
+
+@pytest.fixture
+def app_with_test_runtime(test_runtime: BackendRuntime):
+    return server.create_app(runtime=test_runtime)
+
+
+@pytest.fixture
+def reset_shared_runtime_state(shared_runtime: BackendRuntime):
+    def _reset() -> None:
+        server._clear_shared_shutdown_runtime_state()
+        server._sync_runtime_from_globals(shared_runtime)
+
+    return _reset

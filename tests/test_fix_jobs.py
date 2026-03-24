@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import asyncio
+import importlib
 import json
 import os
 import ssl
@@ -26,7 +27,7 @@ from openplot.models import (
     OpencodeModelOption,
     PlotSession,
 )
-from openplot.services.runtime import build_test_runtime, get_shared_runtime
+from openplot.services.runtime import build_test_runtime
 
 
 @pytest.fixture(autouse=True)
@@ -204,20 +205,47 @@ def test_fix_job_requires_pending_annotations(monkeypatch, tmp_path: Path) -> No
         assert response.status_code == 409
 
 
+def test_fix_jobs_router_delegates_start_to_service(
+    app_with_test_runtime,
+    monkeypatch,
+) -> None:
+    fix_jobs_service = importlib.import_module("openplot.services.fix_jobs")
+
+    called: dict[str, object] = {}
+
+    async def fake_start_fix_job(body, runtime):
+        called["model"] = body.model
+        called["runtime"] = runtime
+        return {"status": "ok", "job": {"id": "job-delegated", "status": "running"}}
+
+    monkeypatch.setattr(fix_jobs_service, "start_fix_job", fake_start_fix_job)
+
+    with TestClient(app_with_test_runtime) as client:
+        response = client.post(
+            "/api/fix-jobs",
+            json={"model": "openai/gpt-5.3-codex", "variant": "high"},
+        )
+
+    assert response.status_code == 200
+    assert response.json()["job"]["id"] == "job-delegated"
+    assert called["model"] == "openai/gpt-5.3-codex"
+
+
 def test_injected_runtime_fix_job_runs_inside_injected_runtime(
     monkeypatch: pytest.MonkeyPatch,
+    app_with_test_runtime,
+    shared_runtime,
+    test_runtime,
     tmp_path: Path,
 ) -> None:
     monkeypatch.setenv("XDG_STATE_HOME", str(tmp_path / "state"))
-    runtime = build_test_runtime(store_root=tmp_path / "isolated-state")
-    shared_runtime = get_shared_runtime()
     shared_runtime.store.fix_jobs.clear()
     shared_runtime.store.active_fix_job_ids_by_session.clear()
 
     script_path = tmp_path / "plot.py"
     _write_script(script_path, color="steelblue")
 
-    result = server.init_session_from_script(script_path, runtime=runtime)
+    result = server.init_session_from_script(script_path, runtime=test_runtime)
     assert result.success
 
     monkeypatch.setattr(
@@ -248,7 +276,7 @@ def test_injected_runtime_fix_job_runs_inside_injected_runtime(
 
     monkeypatch.setattr(server, "_run_opencode_fix_iteration", fake_fix_iteration)
 
-    with TestClient(server.create_app(runtime=runtime)) as client:
+    with TestClient(app_with_test_runtime) as client:
         add_response = client.post(
             "/api/annotations",
             json={"feedback": "fix this", "region": _new_region()},
@@ -264,7 +292,7 @@ def test_injected_runtime_fix_job_runs_inside_injected_runtime(
 
         deadline = time.monotonic() + 3.0
         while time.monotonic() < deadline:
-            job = runtime.store.fix_jobs.get(job_id)
+            job = test_runtime.store.fix_jobs.get(job_id)
             if job is not None and job.status in {
                 FixJobStatus.completed,
                 FixJobStatus.failed,
@@ -274,10 +302,10 @@ def test_injected_runtime_fix_job_runs_inside_injected_runtime(
             time.sleep(0.05)
         else:
             raise AssertionError(
-                f"Injected runtime fix job did not finish: {runtime.store.fix_jobs}"
+                f"Injected runtime fix job did not finish: {test_runtime.store.fix_jobs}"
             )
 
-        assert runtime.store.fix_jobs[job_id].status == FixJobStatus.completed
+        assert test_runtime.store.fix_jobs[job_id].status == FixJobStatus.completed
         assert shared_runtime.store.fix_jobs == {}
 
 
@@ -388,17 +416,18 @@ def test_overlapping_injected_runtime_fix_jobs_do_not_cross_state(
 
 def test_fix_job_endpoints_use_injected_runtime_state(
     monkeypatch: pytest.MonkeyPatch,
+    app_with_test_runtime,
+    shared_runtime,
+    test_runtime,
     tmp_path: Path,
 ) -> None:
     monkeypatch.setenv("XDG_STATE_HOME", str(tmp_path / "state"))
-    runtime = build_test_runtime(store_root=tmp_path / "isolated-state")
-    shared_runtime = get_shared_runtime()
     shared_runtime.store.fix_jobs.clear()
     shared_runtime.store.active_fix_job_ids_by_session.clear()
 
     script_path = tmp_path / "plot.py"
     _write_script(script_path, color="purple")
-    assert server.init_session_from_script(script_path, runtime=runtime).success
+    assert server.init_session_from_script(script_path, runtime=test_runtime).success
 
     monkeypatch.setattr(
         server,
@@ -431,7 +460,7 @@ def test_fix_job_endpoints_use_injected_runtime_state(
 
     monkeypatch.setattr(server, "_run_opencode_fix_iteration", fake_fix_iteration)
 
-    with TestClient(server.create_app(runtime=runtime)) as client:
+    with TestClient(app_with_test_runtime) as client:
         assert (
             client.post(
                 "/api/annotations",
@@ -1740,12 +1769,15 @@ def test_reconcile_stale_active_fix_job_marks_failed() -> None:
 
     session_key = "session-main"
     job.session_id = session_key
-    server._fix_jobs[job.id] = job
-    server._active_fix_job_ids_by_session[session_key] = job.id
+    runtime = build_test_runtime()
+    runtime.store.fix_jobs[job.id] = job
+    runtime.store.active_fix_job_ids_by_session[session_key] = job.id
 
-    asyncio.run(server._reconcile_active_fix_job_state())
+    server._with_runtime(
+        runtime, lambda: asyncio.run(server._reconcile_active_fix_job_state())
+    )
 
-    assert server._active_fix_job_ids_by_session == {}
+    assert runtime.store.active_fix_job_ids_by_session == {}
     assert job.status == FixJobStatus.failed
     assert job.finished_at is not None
     assert job.last_error is not None
@@ -1798,3 +1830,70 @@ def test_app_lifespan_teardown_cleans_fix_job_processes_and_tasks(
     assert server._fix_job_processes == {}
     assert server._fix_jobs == {}
     assert server._active_fix_job_ids_by_session == {}
+
+
+def test_injected_runtime_teardown_only_cleans_its_own_fix_job_resources(
+    monkeypatch,
+    app_with_test_runtime,
+    shared_runtime,
+    test_runtime,
+    tmp_path: Path,
+) -> None:
+    terminated: list[object] = []
+
+    class _FakeTask:
+        def __init__(self) -> None:
+            self.cancel_called = False
+
+        def cancel(self) -> None:
+            self.cancel_called = True
+
+    injected_task = _FakeTask()
+    injected_process = object()
+    injected_job = FixJob(
+        model="openai/gpt-5.3-codex",
+        branch_id="branch-injected",
+        branch_name="main",
+        session_id="session-injected",
+    )
+    shared_job = FixJob(
+        model="openai/gpt-5.3-codex",
+        branch_id="branch-shared",
+        branch_name="main",
+        session_id="session-shared",
+    )
+
+    async def fake_terminate(process) -> None:
+        terminated.append(process)
+
+    monkeypatch.setattr(server, "_terminate_fix_process", fake_terminate)
+
+    test_runtime.infra.fix_job_tasks[injected_job.id] = cast(
+        asyncio.Task[None], injected_task
+    )
+    test_runtime.infra.fix_job_processes[injected_job.id] = cast(
+        asyncio.subprocess.Process, injected_process
+    )
+    test_runtime.store.fix_jobs[injected_job.id] = injected_job
+    test_runtime.store.active_fix_job_ids_by_session[injected_job.session_id] = (
+        injected_job.id
+    )
+
+    shared_runtime.store.fix_jobs[shared_job.id] = shared_job
+    shared_runtime.store.active_fix_job_ids_by_session[shared_job.session_id] = (
+        shared_job.id
+    )
+
+    with TestClient(app_with_test_runtime):
+        pass
+
+    assert terminated == [injected_process]
+    assert injected_task.cancel_called is True
+    assert test_runtime.infra.fix_job_tasks == {}
+    assert test_runtime.infra.fix_job_processes == {}
+    assert test_runtime.store.fix_jobs == {}
+    assert test_runtime.store.active_fix_job_ids_by_session == {}
+    assert shared_runtime.store.fix_jobs == {shared_job.id: shared_job}
+    assert shared_runtime.store.active_fix_job_ids_by_session == {
+        shared_job.session_id: shared_job.id
+    }

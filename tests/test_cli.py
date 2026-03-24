@@ -12,7 +12,6 @@ from openplot import cli as cli_module
 from openplot import desktop as desktop_module
 import openplot.mcp_server as mcp_server
 import openplot.server as server
-from openplot.services.runtime import build_test_runtime, get_shared_runtime
 
 
 def test_serve_without_file_preserves_existing_plot_mode_workspace(
@@ -284,14 +283,15 @@ def test_update_status_refresh_endpoint_returns_shared_payload(monkeypatch) -> N
 
 def test_update_status_refresh_uses_injected_runtime_cache(
     monkeypatch,
+    app_with_test_runtime,
+    shared_runtime,
+    test_runtime,
     tmp_path: Path,
 ) -> None:
-    runtime = build_test_runtime(store_root=tmp_path / "isolated-state")
-    shared_runtime = get_shared_runtime()
     shared_runtime.infra.update_status_cache = None
     shared_runtime.infra.update_status_cache_expires_at = 0.0
-    runtime.infra.update_status_cache = None
-    runtime.infra.update_status_cache_expires_at = 0.0
+    test_runtime.infra.update_status_cache = None
+    test_runtime.infra.update_status_cache_expires_at = 0.0
     monkeypatch.setattr(
         server,
         "_fetch_latest_release_payload",
@@ -303,11 +303,11 @@ def test_update_status_refresh_uses_injected_runtime_cache(
         },
     )
 
-    with TestClient(server.create_app(runtime=runtime)) as client:
+    with TestClient(app_with_test_runtime) as client:
         response = client.post("/api/update-status/refresh")
 
     assert response.status_code == 200
-    assert runtime.infra.update_status_cache is not None
+    assert test_runtime.infra.update_status_cache is not None
     assert shared_runtime.infra.update_status_cache is None
 
 

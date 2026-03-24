@@ -1,11 +1,16 @@
 from __future__ import annotations
 
+import asyncio
+import json
 import sys
 from pathlib import Path
+from typing import Any, cast
 
+import pytest
 from fastapi.testclient import TestClient
 
 import openplot.server as server
+from openplot.services import runners as runner_services
 from openplot.services.runtime import build_test_runtime, get_shared_runtime
 
 
@@ -189,3 +194,59 @@ def test_python_interpreter_endpoint_uses_injected_runtime_state(
 
     assert response.status_code == 200
     assert response.json()["context_dir"] == str(script_path.parent.resolve())
+
+
+def test_python_interpreter_invalid_mode_error_lists_auto() -> None:
+    runtime = build_test_runtime()
+    body = type("InvalidInterpreterRequest", (), {"mode": "invalid", "path": None})()
+
+    with pytest.raises(server.HTTPException) as exc_info:
+        asyncio.run(runner_services.set_python_interpreter(cast(Any, body), runtime))
+
+    assert exc_info.value.status_code == 400
+    assert exc_info.value.detail == "Mode must be 'builtin', 'manual', or 'auto'"
+
+
+def test_python_interpreter_service_uses_injected_runtime_store_root(
+    monkeypatch,
+    tmp_path: Path,
+) -> None:
+    monkeypatch.setenv("OPENPLOT_STATE_DIR", str(tmp_path / "shared-state"))
+    runtime = build_test_runtime(store_root=tmp_path / "isolated-state")
+    assert runtime.state_root is not None
+    runtime_state_root = runtime.state_root.resolve()
+    project_dir = tmp_path / "project"
+    project_dir.mkdir(parents=True)
+    manual_wrapper = _make_manual_wrapper(project_dir)
+
+    server._with_runtime(runtime, lambda: server.set_workspace_dir(project_dir))
+
+    set_payload = asyncio.run(
+        runner_services.set_python_interpreter(
+            cast(
+                Any,
+                type(
+                    "ManualInterpreterRequest",
+                    (),
+                    {"mode": "manual", "path": str(manual_wrapper)},
+                )(),
+            ),
+            runtime,
+        )
+    )
+    get_payload = asyncio.run(runner_services.get_python_interpreter(runtime))
+
+    runtime_preferences = runtime_state_root / "preferences.json"
+    shared_preferences = (tmp_path / "shared-state" / "preferences.json").resolve()
+
+    assert set_payload["mode"] == "manual"
+    assert set_payload["configured_path"] == str(manual_wrapper)
+    assert set_payload["state_root"] == str(runtime_state_root)
+    assert get_payload["mode"] == "manual"
+    assert get_payload["configured_path"] == str(manual_wrapper)
+    assert get_payload["state_root"] == str(runtime_state_root)
+    assert runtime_preferences.exists()
+    assert json.loads(runtime_preferences.read_text())["python_interpreter"] == str(
+        manual_wrapper
+    )
+    assert not shared_preferences.exists()

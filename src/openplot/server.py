@@ -6,7 +6,6 @@ import ast
 import asyncio
 import json
 import locale
-import mimetypes
 import os
 import platform
 import pkgutil
@@ -22,8 +21,6 @@ import tempfile
 import threading
 import time
 import uuid
-import webbrowser
-import zipfile
 from contextvars import ContextVar, Token
 from contextlib import asynccontextmanager, contextmanager, suppress
 from dataclasses import dataclass
@@ -43,7 +40,7 @@ from fastapi import (
     WebSocketDisconnect,
 )
 from fastapi.middleware.cors import CORSMiddleware
-from fastapi.responses import FileResponse, HTMLResponse
+from fastapi.responses import HTMLResponse
 from fastapi.staticfiles import StaticFiles
 
 from . import __version__
@@ -69,7 +66,6 @@ from .api.schemas import (
 )
 from .domain.annotations import pending_annotations_for_context
 from .executor import ExecutionResult, execute_script
-from .feedback import compile_feedback
 from .models import (
     Annotation,
     AnnotationStatus,
@@ -103,12 +99,6 @@ from .models import (
     Revision,
     VersionNode,
 )
-from .services.naming import (
-    ensure_unique_branch_name,
-    normalize_branch_name,
-    normalize_workspace_name,
-    sync_fix_job_branch_names,
-)
 from .services.runtime import (
     BackendRuntime,
     build_update_status_payload,
@@ -118,6 +108,13 @@ from .services.runtime import (
     set_runtime_workspace_dir,
     write_runtime_port_file,
 )
+from .services import runners as runner_services
+from .services import sessions as session_services
+from .services import annotations as annotation_services
+from .services import artifacts as artifact_services
+from .services import fix_jobs as fix_job_services
+from .services import plot_mode as plot_mode_services
+from .services import versioning as versioning_services
 
 if TYPE_CHECKING:
     from collections.abc import AsyncGenerator
@@ -260,7 +257,7 @@ def _runtime_context(runtime: BackendRuntime):
 
 
 def _current_runtime() -> BackendRuntime:
-    return _current_runtime_var.get() or get_shared_runtime()
+    return _current_runtime_var.get() or _bound_runtime or get_shared_runtime()
 
 
 def _runtime_sessions_map() -> dict[str, PlotSession]:
@@ -1829,7 +1826,7 @@ def _ensure_runner_is_available(runner: FixRunner) -> None:
 
 def set_workspace_dir(path: str | Path) -> Path:
     """Set the workspace directory used by agent subprocesses."""
-    runtime = _current_runtime_var.get() or get_shared_runtime()
+    runtime = _current_runtime()
     resolved = set_runtime_workspace_dir(runtime, Path(path))
     global _workspace_dir
     if _runtime_is_shared(runtime):
@@ -8228,7 +8225,7 @@ def _persist_session(session: PlotSession, *, promote: bool) -> None:
     _save_session_registry()
 
 
-def _ensure_session_store_loaded(*, force_reload: bool = False) -> None:
+def _ensure_session_store_loaded_impl(*, force_reload: bool = False) -> None:
     global _active_session_id
     global _loaded_session_store_root
     global _plot_mode
@@ -8306,6 +8303,12 @@ def _ensure_session_store_loaded(*, force_reload: bool = False) -> None:
         set_workspace_dir(Path(_plot_mode.workspace_dir))
 
     _loaded_session_store_root = sessions_root
+
+
+def _ensure_session_store_loaded(*, force_reload: bool = False) -> None:
+    session_services.ensure_session_store_loaded(
+        _current_runtime(), force_reload=force_reload
+    )
 
 
 def _set_active_session(session_id: str | None, *, clear_plot_mode: bool) -> None:
@@ -8393,28 +8396,7 @@ def _workspace_summary_sort_key(summary: Mapping[str, object]) -> tuple[str, str
 
 
 def _list_session_summaries() -> list[dict[str, object]]:
-    _ensure_session_store_loaded()
-    sessions = _runtime_sessions_map()
-    active_plot_mode = _runtime_plot_mode_state_value()
-    summaries = [_session_summary(session) for session in sessions.values()]
-
-    # Include all persisted plot-mode workspaces, not just the active one.
-    # Skip any whose ID already exists as an annotation session (promoted).
-    seen_ids: set[str] = {
-        _session_workspace_id(session) for session in sessions.values()
-    }
-    if active_plot_mode is not None and _plot_mode_is_workspace(active_plot_mode):
-        if active_plot_mode.id not in seen_ids:
-            summaries.append(_plot_mode_summary(active_plot_mode))
-            seen_ids.add(active_plot_mode.id)
-
-    for pm_workspace in _load_all_plot_mode_workspaces():
-        if pm_workspace.id not in seen_ids:
-            summaries.append(_plot_mode_summary(pm_workspace))
-            seen_ids.add(pm_workspace.id)
-
-    summaries.sort(key=_workspace_summary_sort_key, reverse=True)
-    return summaries
+    return session_services.list_session_summaries(_current_runtime())
 
 
 def _last_modified_session() -> PlotSession | None:
@@ -8450,18 +8432,7 @@ def _active_workspace_id() -> str | None:
 def _restore_latest_workspace() -> (
     tuple[Literal["annotation", "plot"], PlotSession | PlotModeState] | None
 ):
-    latest_session = _last_modified_session()
-    latest_plot_mode = _last_modified_plot_mode()
-
-    if latest_session is None and latest_plot_mode is None:
-        return None
-    if latest_session is None:
-        return ("plot", cast(PlotModeState, latest_plot_mode))
-    if latest_plot_mode is None:
-        return ("annotation", latest_session)
-    if _session_sort_key(latest_session) >= _plot_mode_sort_key(latest_plot_mode):
-        return ("annotation", latest_session)
-    return ("plot", latest_plot_mode)
+    return session_services.restore_latest_workspace(_current_runtime())
 
 
 def _bootstrap_payload(
@@ -9936,11 +9907,7 @@ async def _lifespan(app: FastAPI) -> AsyncGenerator[None]:
     startup_complete = False
     try:
         claim_runtime_lifecycle(runtime, owner_token)
-        should_reload_from_disk = _runtime_is_shared(runtime) or (
-            runtime.store.loaded_session_store_root is None
-            and not runtime.store.sessions
-            and runtime.store.plot_mode is None
-        )
+        should_reload_from_disk = session_services.should_restore_session_store(runtime)
         if should_reload_from_disk:
             if _runtime_is_shared(runtime):
                 with _runtime_context(runtime):
@@ -9950,6 +9917,7 @@ async def _lifespan(app: FastAPI) -> AsyncGenerator[None]:
                     runtime,
                     lambda: _ensure_session_store_loaded(force_reload=False),
                 )
+            session_services.restore_latest_workspace_into_runtime(runtime)
         startup_complete = True
     except Exception:
         release_runtime_lifecycle(runtime, owner_token)
@@ -9959,33 +9927,7 @@ async def _lifespan(app: FastAPI) -> AsyncGenerator[None]:
         yield
     finally:
         if startup_complete:
-            with _runtime_context(runtime):
-                fix_job_processes = _runtime_fix_job_processes_map()
-                fix_job_tasks = _runtime_fix_job_tasks_map()
-                fix_jobs = _runtime_fix_jobs_map()
-                active_fix_jobs = _runtime_active_fix_jobs_map()
-                port_file_path = runtime.infra.port_file_path
-                if runtime.infra.owns_port_file and port_file_path is not None:
-                    port_file_path.unlink(missing_ok=True)
-                for process in list(fix_job_processes.values()):
-                    await _terminate_fix_process(process)
-                for task in list(fix_job_tasks.values()):
-                    task.cancel()
-                fix_job_processes.clear()
-                fix_job_tasks.clear()
-                fix_jobs.clear()
-                active_fix_jobs.clear()
-                runtime.infra.ws_clients.clear()
-                if _runtime_is_shared(runtime):
-                    _clear_shared_shutdown_runtime_state()
-                else:
-                    runtime.store.plot_mode = None
-                    runtime.store.active_session = None
-                    runtime.store.active_session_id = None
-                    runtime.store.sessions.clear()
-                    runtime.store.session_order.clear()
-                    runtime.store.loaded_session_store_root = None
-                runtime.infra.owns_port_file = False
+            await session_services.teardown_runtime(runtime)
         release_runtime_lifecycle(runtime, owner_token)
 
 
@@ -10117,7 +10059,327 @@ def write_port_file(port: int) -> None:
 # ---------------------------------------------------------------------------
 
 
+# ---- API / WebSocket handlers ----
+
+
+async def get_bootstrap_state(request: Request):
+    runtime = cast(BackendRuntime, request.app.state.runtime)
+    return session_services.build_bootstrap_payload(runtime)
+
+
+async def get_plot_mode_state(request: Request):
+    runtime = cast(BackendRuntime, request.app.state.runtime)
+    return plot_mode_services.get_plot_mode_state(runtime)
+
+
+async def set_plot_mode_files():
+    return await plot_mode_services.set_plot_mode_files()
+
+
+async def suggest_plot_mode_paths(
+    body: PlotModePathSuggestionsRequest,
+    request: Request,
+):
+    runtime = cast(BackendRuntime, request.app.state.runtime)
+    return await plot_mode_services.suggest_plot_mode_paths(body, runtime)
+
+
+async def select_plot_mode_paths(
+    body: PlotModeSelectPathsRequest,
+    request: Request,
+):
+    runtime = cast(BackendRuntime, request.app.state.runtime)
+    return await plot_mode_services.select_plot_mode_paths(body, runtime)
+
+
+async def update_plot_mode_settings(body: PlotModeSettingsRequest):
+    return await plot_mode_services.update_plot_mode_settings(body)
+
+
+async def submit_plot_mode_tabular_hint(body: PlotModeTabularHintRequest):
+    return await plot_mode_services.submit_plot_mode_tabular_hint(body)
+
+
+async def answer_plot_mode_question(body: PlotModeQuestionAnswerRequest):
+    return await plot_mode_services.answer_plot_mode_question(body)
+
+
+async def run_plot_mode_chat(body: PlotModeChatRequest, request: Request):
+    runtime = cast(BackendRuntime, request.app.state.runtime)
+    return await plot_mode_services.run_plot_mode_chat(body, runtime)
+
+
+async def finalize_plot_mode(body: PlotModeFinalizeRequest, request: Request):
+    runtime = cast(BackendRuntime, request.app.state.runtime)
+    return await plot_mode_services.finalize_plot_mode(body, runtime)
+
+
+async def rename_plot_mode_workspace(request: Request):
+    runtime = cast(BackendRuntime, request.app.state.runtime)
+    body = await request.json()
+    return await plot_mode_services.rename_plot_mode_workspace(runtime, body)
+
+
+async def delete_plot_mode_workspace(request: Request):
+    runtime = cast(BackendRuntime, request.app.state.runtime)
+    requested_id: str | None = None
+    try:
+        body = await request.json()
+        if isinstance(body, dict):
+            requested_id = body.get("id")
+    except Exception:
+        pass
+    return await plot_mode_services.delete_plot_mode_workspace(runtime, requested_id)
+
+
+async def activate_plot_mode(request: Request):
+    runtime = cast(BackendRuntime, request.app.state.runtime)
+    requested_id: str | None = None
+    try:
+        body = await request.json()
+        if isinstance(body, dict):
+            requested_id = body.get("id")
+    except Exception:
+        pass
+    return await plot_mode_services.activate_plot_mode(runtime, requested_id)
+
+
+async def get_session_state(session_id: str | None = None):
+    return session_services.get_session_state(session_id=session_id)
+
+
+async def list_sessions(request: Request):
+    runtime = cast(BackendRuntime, request.app.state.runtime)
+    return session_services.build_sessions_payload(runtime)
+
+
+async def create_new_session(request: Request):
+    runtime = cast(BackendRuntime, request.app.state.runtime)
+    return await session_services.create_new_session(runtime)
+
+
+async def activate_session(session_id: str, request: Request):
+    runtime = cast(BackendRuntime, request.app.state.runtime)
+    return await session_services.activate_session(runtime, session_id)
+
+
+async def rename_session(
+    session_id: str,
+    body: RenameSessionRequest,
+    request: Request,
+):
+    runtime = cast(BackendRuntime, request.app.state.runtime)
+    return session_services.rename_session(runtime, session_id, body)
+
+
+async def delete_session(session_id: str, request: Request):
+    runtime = cast(BackendRuntime, request.app.state.runtime)
+    return await session_services.delete_session(runtime, session_id)
+
+
+async def get_preferences():
+    return await runner_services.get_preferences()
+
+
+async def set_preferences(body: PreferencesRequest):
+    return await runner_services.set_preferences(body)
+
+
+async def get_runners():
+    return await runner_services.get_runners()
+
+
+async def get_runner_status():
+    return await runner_services.get_runner_status()
+
+
+async def install_runner(body: RunnerInstallRequest, request: Request):
+    runtime = cast(BackendRuntime, request.app.state.runtime)
+    return await runner_services.install_runner(body, runtime)
+
+
+async def launch_runner_auth(body: RunnerAuthLaunchRequest):
+    return await runner_services.launch_runner_auth(body)
+
+
+async def open_external_url(body: OpenExternalUrlRequest):
+    return await runner_services.open_external_url(body)
+
+
+async def refresh_update_status(request: Request):
+    runtime = cast(BackendRuntime, request.app.state.runtime)
+    return await runner_services.refresh_update_status(runtime)
+
+
+async def get_python_interpreter(request: Request, session_id: str | None = None):
+    runtime = cast(BackendRuntime, request.app.state.runtime)
+    return await runner_services.get_python_interpreter(runtime, session_id=session_id)
+
+
+async def set_python_interpreter(body: PythonInterpreterRequest, request: Request):
+    runtime = cast(BackendRuntime, request.app.state.runtime)
+    return await runner_services.set_python_interpreter(body, runtime)
+
+
+async def get_runner_models(runner: str = "opencode", force_refresh: bool = False):
+    return await runner_services.get_runner_models(
+        runner=runner,
+        force_refresh=force_refresh,
+    )
+
+
+async def get_opencode_models(force_refresh: bool = False):
+    return await runner_services.get_opencode_models(force_refresh=force_refresh)
+
+
+async def list_fix_jobs(
+    request: Request,
+    limit: int = 20,
+    session_id: str | None = None,
+):
+    runtime = cast(BackendRuntime, request.app.state.runtime)
+    return await fix_job_services.list_fix_jobs(
+        runtime,
+        limit=limit,
+        session_id=session_id,
+    )
+
+
+async def get_current_fix_job(request: Request, session_id: str | None = None):
+    runtime = cast(BackendRuntime, request.app.state.runtime)
+    return await fix_job_services.get_current_fix_job(runtime, session_id=session_id)
+
+
+async def start_fix_job(body: StartFixJobRequest, request: Request):
+    runtime = cast(BackendRuntime, request.app.state.runtime)
+    return await fix_job_services.start_fix_job(body, runtime)
+
+
+async def cancel_fix_job(job_id: str, request: Request):
+    _ = request
+    return await fix_job_services.cancel_fix_job(job_id)
+
+
+# ---- Plot file serving ----
+
+
+async def get_plot(
+    request: Request,
+    session_id: str | None = None,
+    version_id: str | None = None,
+    plot_mode: bool = False,
+    workspace_id: str | None = None,
+):
+    runtime = cast(BackendRuntime, request.app.state.runtime)
+    return await artifact_services.get_plot(
+        runtime,
+        session_id=session_id,
+        version_id=version_id,
+        plot_mode=plot_mode,
+        workspace_id=workspace_id,
+    )
+
+
+async def export_plot_mode_workspace(
+    request: Request,
+    workspace_id: str | None = None,
+):
+    runtime = cast(BackendRuntime, request.app.state.runtime)
+    return await artifact_services.export_plot_mode_workspace(
+        runtime,
+        workspace_id=workspace_id,
+    )
+
+
+# ---- Branch / checkout ----
+
+
+async def checkout_version(body: CheckoutVersionRequest):
+    return await versioning_services.checkout_version(body)
+
+
+async def checkout_branch_head(branch_id: str):
+    return await versioning_services.checkout_branch_head(branch_id)
+
+
+async def rename_branch(
+    branch_id: str,
+    body: RenameBranchRequest,
+    request: Request,
+):
+    runtime = cast(BackendRuntime, request.app.state.runtime)
+    return await versioning_services.rename_branch(branch_id, body, runtime)
+
+
+# ---- Annotations ----
+
+
+async def add_annotation(annotation: Annotation):
+    return await annotation_services.add_annotation(annotation)
+
+
+async def export_annotation_plot(annotation_id: str):
+    return await annotation_services.export_annotation_plot(annotation_id)
+
+
+async def delete_annotation(annotation_id: str):
+    return await annotation_services.delete_annotation(annotation_id)
+
+
+async def update_annotation(annotation_id: str, updates: AnnotationUpdateRequest):
+    return await annotation_services.update_annotation(annotation_id, updates)
+
+
+# ---- Feedback compilation ----
+
+
+async def get_feedback(session_id: str | None = None):
+    return await artifact_services.get_feedback(session_id=session_id)
+
+
+# ---- Script submission (from MCP / agent) ----
+
+
+async def submit_script(body: SubmitScriptRequest, session_id: str | None = None):
+    return await versioning_services.submit_script(body, session_id=session_id)
+
+
+# ---- Revision history ----
+
+
+async def get_revisions():
+    return await versioning_services.get_revisions()
+
+
+# ---- WebSocket ----
+
+
+async def websocket_endpoint(ws: WebSocket):
+    runtime = cast(BackendRuntime, ws.app.state.runtime)
+    await ws.accept()
+    runtime.infra.ws_clients.add(ws)
+    with _runtime_context(runtime):
+        try:
+            while True:
+                _ = await ws.receive_text()
+        except WebSocketDisconnect:
+            pass
+        finally:
+            runtime.infra.ws_clients.discard(ws)
+
+
 def _register_routes(app: FastAPI) -> None:
+    from .api.annotations import router as annotations_router
+    from .api.artifacts import router as artifacts_router
+    from .api.fix_jobs import router as fix_jobs_router
+    from .api.plot_mode import router as plot_mode_router
+    from .api.preferences import router as preferences_router
+    from .api.runners import router as runners_router
+    from .api.runtime import router as runtime_router
+    from .api.sessions import router as sessions_router
+    from .api.versioning import router as versioning_router
+    from .api.ws import router as ws_router
+
     @app.get("/", response_class=HTMLResponse)
     async def index():
         static_dir = _resolve_static_dir()
@@ -10133,2502 +10395,13 @@ def _register_routes(app: FastAPI) -> None:
             "</body></html>"
         )
 
-    # ---- Session ----
-
-    @app.get("/api/bootstrap")
-    async def get_bootstrap_state(request: Request):
-        runtime = cast(BackendRuntime, request.app.state.runtime)
-
-        def _build_bootstrap() -> dict[str, object]:
-            _ensure_session_store_loaded()
-
-            latest_workspace = _restore_latest_workspace()
-            if latest_workspace is not None:
-                workspace_mode, workspace = latest_workspace
-                if workspace_mode == "annotation":
-                    _set_active_session(workspace.id, clear_plot_mode=False)
-                    session = get_session()
-                    _rebuild_revision_history(session)
-                    return _bootstrap_payload(
-                        mode="annotation", session=session, plot_mode=None
-                    )
-
-                _set_active_session(None, clear_plot_mode=False)
-                state = _get_plot_mode_state()
-                return _bootstrap_payload(mode="plot", session=None, plot_mode=state)
-
-            state = _plot_mode or init_plot_mode_session(workspace_dir=_workspace_dir)
-            return _bootstrap_payload(mode="plot", session=None, plot_mode=state)
-
-        return _with_runtime(runtime, _build_bootstrap)
-
-    @app.get("/api/plot-mode")
-    async def get_plot_mode_state(request: Request):
-        runtime = cast(BackendRuntime, request.app.state.runtime)
-
-        def _build_plot_mode() -> dict[str, object]:
-            _ensure_session_store_loaded()
-
-            if _session is not None:
-                session = get_session()
-                _rebuild_revision_history(session)
-                return _bootstrap_payload(
-                    mode="annotation", session=session, plot_mode=None
-                )
-
-            state = _plot_mode or init_plot_mode_session(workspace_dir=_workspace_dir)
-            return _bootstrap_payload(mode="plot", session=None, plot_mode=state)
-
-        return _with_runtime(runtime, _build_plot_mode)
-
-    @app.post("/api/plot-mode/files")
-    async def set_plot_mode_files():
-        raise HTTPException(
-            status_code=410,
-            detail=(
-                "File uploads are no longer supported in plot mode. "
-                "Use path selection endpoints instead."
-            ),
-        )
-
-    @app.post("/api/plot-mode/path-suggestions")
-    async def suggest_plot_mode_paths(
-        body: PlotModePathSuggestionsRequest,
-        request: Request,
-    ):
-        runtime = cast(BackendRuntime, request.app.state.runtime)
-
-        def _suggest() -> dict[str, object]:
-            _ensure_session_store_loaded()
-            if _runtime_active_session_value() is not None:
-                raise HTTPException(
-                    status_code=409,
-                    detail="Annotation mode is active; restart without a script to use plot mode.",
-                )
-
-            selection_type = body.selection_type
-            query = body.query.strip()
-            base_dir = _plot_mode_workspace_base_dir(body.workspace_id)
-            parent_dir, suggestions = _list_path_suggestions(
-                query=query,
-                selection_type=selection_type,
-                base_dir=base_dir,
-            )
-            return {
-                "query": query,
-                "selection_type": selection_type,
-                "base_dir": str(parent_dir.resolve()),
-                "suggestions": suggestions,
-            }
-
-        return _with_runtime(runtime, _suggest)
-
-    @app.post("/api/plot-mode/select-paths")
-    async def select_plot_mode_paths(
-        body: PlotModeSelectPathsRequest,
-        request: Request,
-    ):
-        runtime = cast(BackendRuntime, request.app.state.runtime)
-
-        normalized_paths: list[str] = []
-        for item in body.paths:
-            text = item.strip()
-            if text:
-                normalized_paths.append(text)
-
-        selection_type = body.selection_type
-
-        if not normalized_paths:
-            raise HTTPException(status_code=400, detail="No paths provided")
-
-        if selection_type == "script":
-
-            def _select_script_path() -> dict[str, object]:
-                if len(normalized_paths) != 1:
-                    raise HTTPException(
-                        status_code=400,
-                        detail="Script selection expects exactly one .py path",
-                    )
-
-                state = _resolve_plot_mode_workspace(
-                    body.workspace_id,
-                    create_if_missing=True,
-                )
-                base_dir = _plot_mode_picker_base_dir(state)
-                script_path = _resolve_selected_file_path(
-                    raw_path=normalized_paths[0],
-                    selection_type="script",
-                    base_dir=base_dir,
-                )
-                discard_empty_workspace = not _plot_mode_has_user_content(state)
-                result = init_session_from_script(script_path, runtime=runtime)
-                if result.success and discard_empty_workspace:
-                    _delete_plot_mode_snapshot(state=state, clear_active_snapshot=False)
-                if not result.success:
-                    raise HTTPException(
-                        status_code=422,
-                        detail={
-                            "error": result.error,
-                            "stderr": result.stderr,
-                            "stdout": result.stdout,
-                        },
-                    )
-
-                session = get_session()
-                _rebuild_revision_history(session)
-                return _bootstrap_payload(
-                    mode="annotation", session=session, plot_mode=None
-                )
-
-            return _with_runtime(runtime, _select_script_path)
-
-        def _select_data_paths() -> tuple[PlotModeState, dict[str, object]]:
-            _ensure_session_store_loaded()
-            if _runtime_active_session_value() is not None:
-                raise HTTPException(
-                    status_code=409,
-                    detail="Annotation mode is active; restart without a script to use plot mode.",
-                )
-
-            state = _resolve_plot_mode_workspace(
-                body.workspace_id, create_if_missing=True
-            )
-            base_dir = _plot_mode_picker_base_dir(state)
-
-            if state.files:
-                raise HTTPException(
-                    status_code=409,
-                    detail="No more files can be added to this workspace. Use New workspace to start over.",
-                )
-
-            selected_files: list[PlotModeFile] = []
-            seen_paths: set[str] = set()
-            for raw_path in normalized_paths:
-                resolved_path = _resolve_selected_file_path(
-                    raw_path=raw_path,
-                    selection_type="data",
-                    base_dir=base_dir,
-                )
-                key = str(resolved_path)
-                if key in seen_paths:
-                    continue
-                seen_paths.add(key)
-                try:
-                    size_bytes = resolved_path.stat().st_size
-                except OSError as exc:
-                    raise HTTPException(
-                        status_code=422,
-                        detail=f"Failed to inspect file '{resolved_path}': {exc}",
-                    ) from exc
-
-                content_type = mimetypes.guess_type(str(resolved_path))[0] or ""
-                selected_files.append(
-                    PlotModeFile(
-                        name=resolved_path.name,
-                        stored_path=key,
-                        size_bytes=size_bytes,
-                        content_type=content_type,
-                        is_python=False,
-                    )
-                )
-
-            if not selected_files:
-                raise HTTPException(status_code=400, detail="No data files selected")
-
-            state.files = selected_files
-            state.phase = PlotModePhase.profiling_data
-            _promote_plot_mode_workspace(state)
-            _populate_plot_mode_data_messages(state)
-            _touch_plot_mode(state)
-            return state, _bootstrap_payload(mode="plot", session=None, plot_mode=state)
-
-        state, payload = _with_runtime(runtime, _select_data_paths)
-        await _broadcast_plot_mode_state(state)
-        return payload
-
-    @app.patch("/api/plot-mode/settings")
-    async def update_plot_mode_settings(body: PlotModeSettingsRequest):
-        _ensure_session_store_loaded()
-        if _session is not None:
-            raise HTTPException(
-                status_code=409,
-                detail="Annotation mode is active; plot mode settings are unavailable.",
-            )
-
-        state = _resolve_plot_mode_workspace(body.workspace_id, create_if_missing=True)
-        state.execution_mode = PlotModeExecutionMode(body.execution_mode)
-        _touch_plot_mode(state)
-        await _broadcast_plot_mode_state(state)
-        return {"status": "ok", "plot_mode": state.model_dump(mode="json")}
-
-    @app.post("/api/plot-mode/tabular-hint")
-    async def submit_plot_mode_tabular_hint(body: PlotModeTabularHintRequest):
-        _ensure_session_store_loaded()
-        if _session is not None:
-            raise HTTPException(
-                status_code=409,
-                detail="Annotation mode is active; tabular selection is unavailable.",
-            )
-
-        state = _resolve_plot_mode_workspace(body.workspace_id)
-        _sync_plot_mode_runner_selection(
-            state, runner=body.runner, model=body.model, variant=body.variant
-        )
-        selector = state.tabular_selector
-        if selector is None or selector.id != body.selector_id:
-            raise HTTPException(
-                status_code=409,
-                detail="No matching tabular source selector is active.",
-            )
-
-        regions_payload: list[dict[str, int | str]] = [
-            {
-                "sheet_id": region.sheet_id,
-                "row_start": region.row_start,
-                "row_end": region.row_end,
-                "col_start": region.col_start,
-                "col_end": region.col_end,
-            }
-            for region in body.regions
-        ]
-        if not regions_payload:
-            singular_values = [
-                body.sheet_id,
-                body.row_start,
-                body.row_end,
-                body.col_start,
-                body.col_end,
-            ]
-            if all(value is not None for value in singular_values):
-                row_start = cast(int, body.row_start)
-                row_end = cast(int, body.row_end)
-                col_start = cast(int, body.col_start)
-                col_end = cast(int, body.col_end)
-                regions_payload = [
-                    {
-                        "sheet_id": cast(str, body.sheet_id),
-                        "row_start": row_start,
-                        "row_end": row_end,
-                        "col_start": col_start,
-                        "col_end": col_end,
-                    }
-                ]
-        if not regions_payload:
-            raise HTTPException(
-                status_code=400,
-                detail="Mark at least one spreadsheet region before continuing.",
-            )
-
-        selected_regions: list[PlotModeTabularSelectionRegion] = []
-        for region_payload in regions_payload:
-            sheet = next(
-                (
-                    sheet
-                    for sheet in selector.sheets
-                    if sheet.id == cast(str, region_payload["sheet_id"])
-                ),
-                None,
-            )
-            if sheet is None or not sheet.preview_rows:
-                raise HTTPException(
-                    status_code=400,
-                    detail="Selected sheet preview is unavailable.",
-                )
-
-            max_row_index = len(sheet.preview_rows) - 1
-            max_col_index = max((len(row) for row in sheet.preview_rows), default=0) - 1
-            if max_row_index < 0 or max_col_index < 0:
-                raise HTTPException(
-                    status_code=400,
-                    detail="Selected sheet does not contain previewable cells.",
-                )
-
-            row_start = max(
-                0,
-                min(
-                    cast(int, region_payload["row_start"]),
-                    cast(int, region_payload["row_end"]),
-                    max_row_index,
-                ),
-            )
-            row_end = max(
-                0,
-                min(
-                    max(
-                        cast(int, region_payload["row_start"]),
-                        cast(int, region_payload["row_end"]),
-                    ),
-                    max_row_index,
-                ),
-            )
-            col_start = max(
-                0,
-                min(
-                    cast(int, region_payload["col_start"]),
-                    cast(int, region_payload["col_end"]),
-                    max_col_index,
-                ),
-            )
-            col_end = max(
-                0,
-                min(
-                    max(
-                        cast(int, region_payload["col_start"]),
-                        cast(int, region_payload["col_end"]),
-                    ),
-                    max_col_index,
-                ),
-            )
-            selected_regions.append(
-                PlotModeTabularSelectionRegion(
-                    sheet_id=sheet.id,
-                    sheet_name=sheet.name,
-                    bounds=PlotModeSheetBounds(
-                        row_start=row_start,
-                        row_end=row_end,
-                        col_start=col_start,
-                        col_end=col_end,
-                    ),
-                )
-            )
-
-        instruction = (body.note or "").strip() or None
-        await _apply_tabular_range_proposal(
-            state,
-            selector,
-            selected_regions=selected_regions,
-            instruction=instruction,
-            activity_title="Range proposal",
-        )
-        _promote_plot_mode_workspace(state)
-        await _broadcast_plot_mode_state(state)
-        return {"status": "ok", "plot_mode": state.model_dump(mode="json")}
-
-    @app.post("/api/plot-mode/answer")
-    async def answer_plot_mode_question(body: PlotModeQuestionAnswerRequest):
-        _ensure_session_store_loaded()
-        if _session is not None:
-            raise HTTPException(
-                status_code=409,
-                detail="Annotation mode is active; plot mode questions are unavailable.",
-            )
-
-        state = _resolve_plot_mode_workspace(body.workspace_id)
-        _sync_plot_mode_runner_selection(
-            state, runner=body.runner, model=body.model, variant=body.variant
-        )
-        pending = state.pending_question_set
-        if pending is None or pending.id != body.question_set_id:
-            raise HTTPException(
-                status_code=409, detail="No matching plot-mode question is pending."
-            )
-
-        answer_map = _answer_map_for_question_set(body)
-        answered_questions = _apply_answers_to_question_set(pending, answer_map)
-        first_option_ids, first_answer_text = _first_answer_for_question_set(
-            answered_questions
-        )
-        answer_summary = _question_set_answer_summary(answered_questions)
-
-        if pending.purpose == "select_data_source":
-            option_ids = first_option_ids
-            answer_text = first_answer_text or ""
-            if not option_ids:
-                if not answer_text:
-                    raise HTTPException(
-                        status_code=400,
-                        detail="Select one of the proposed data sources before continuing.",
-                    )
-                lowered_answer = answer_text.lower()
-                inferred = next(
-                    (
-                        profile.id
-                        for profile in state.data_profiles
-                        if lowered_answer in profile.source_label.lower()
-                        or lowered_answer in profile.file_name.lower()
-                        or (
-                            profile.table_name is not None
-                            and lowered_answer in profile.table_name.lower()
-                        )
-                    ),
-                    None,
-                )
-                if inferred is None:
-                    raise HTTPException(
-                        status_code=400,
-                        detail="I could not map that answer to one of the proposed data sources.",
-                    )
-                option_ids = [inferred]
-            selected_id = option_ids[0]
-            profile = next(
-                (
-                    profile
-                    for profile in state.data_profiles
-                    if profile.id == selected_id
-                ),
-                None,
-            )
-            if profile is None:
-                raise HTTPException(
-                    status_code=400,
-                    detail="Selected data source is no longer available.",
-                )
-
-            state.pending_question_set = None
-            _clear_selected_plot_mode_source_context(state)
-            state.latest_plan_summary = ""
-            state.latest_plan_outline = []
-            state.latest_plan_plot_type = ""
-            state.latest_plan_actions = []
-            _mark_question_set_answered(
-                state,
-                body.question_set_id,
-                answered_questions=answered_questions,
-            )
-            _append_plot_mode_message(
-                state, role="user", content=f"Use {profile.source_label}."
-            )
-            state.phase = PlotModePhase.awaiting_data_choice
-            _present_profile_for_confirmation(state, profile)
-            await _broadcast_plot_mode_state(state)
-            return {"status": "ok", "plot_mode": state.model_dump(mode="json")}
-
-        if pending.purpose == "confirm_tabular_range":
-            profile_id = pending.source_ids[0] if pending.source_ids else ""
-            profile = next(
-                (
-                    profile
-                    for profile in state.data_profiles
-                    if profile.id == profile_id
-                ),
-                None,
-            )
-            if profile is None:
-                raise HTTPException(
-                    status_code=400,
-                    detail="The proposed spreadsheet range is no longer available.",
-                )
-
-            decision = first_option_ids[0] if first_option_ids else ""
-            answer_text = first_answer_text or ""
-            if not decision and answer_text:
-                lowered = answer_text.lower()
-                looks_like_range_note = (
-                    any(
-                        token in lowered
-                        for token in ["column", "columns", "row", "rows", "only"]
-                    )
-                    or bool(
-                        re.search(r"\b[a-z]{1,3}\s*(?::|-|and)\s*[a-z]{1,3}\b", lowered)
-                    )
-                    or bool(
-                        re.search(r"\b[a-z]{1,3}\d+\s*:\s*[a-z]{1,3}\d+\b", lowered)
-                    )
-                )
-                if looks_like_range_note:
-                    decision = "re_infer_from_note"
-                elif any(
-                    token in lowered
-                    for token in ["use", "yes", "confirm", "correct", "looks good"]
-                ):
-                    decision = "use_proposed_range"
-                elif any(
-                    token in lowered
-                    for token in ["adjust", "redraw", "reselect", "new hint", "mark"]
-                ):
-                    decision = "adjust_selection"
-                else:
-                    decision = "re_infer_from_note"
-
-            if decision not in {
-                "use_proposed_range",
-                "adjust_selection",
-                "re_infer_from_note",
-            }:
-                raise HTTPException(
-                    status_code=400,
-                    detail="Confirm the proposed regions, mark new regions, or give a note to re-infer them.",
-                )
-
-            state.pending_question_set = None
-            _mark_question_set_answered(
-                state,
-                body.question_set_id,
-                answered_questions=answered_questions,
-            )
-
-            if decision == "use_proposed_range":
-                ok, error_message = await _start_plot_mode_planning_for_profile(
-                    state,
-                    profile,
-                )
-                if not ok:
-                    return {
-                        "status": "error",
-                        "plot_mode": state.model_dump(mode="json"),
-                        "error": error_message or "Planning failed",
-                    }
-                return {"status": "ok", "plot_mode": state.model_dump(mode="json")}
-
-            _clear_selected_plot_mode_source_context(state)
-            if decision == "adjust_selection":
-                if state.tabular_selector is None:
-                    raise HTTPException(
-                        status_code=400,
-                        detail="Range selection is unavailable for this source.",
-                    )
-                state.tabular_selector.requires_user_hint = True
-                state.tabular_selector.inferred_profile_id = None
-                state.phase = PlotModePhase.awaiting_data_choice
-                await _broadcast_plot_mode_state(state)
-                return {"status": "ok", "plot_mode": state.model_dump(mode="json")}
-
-            if state.tabular_selector is None:
-                raise HTTPException(
-                    status_code=400,
-                    detail="Range re-inference is unavailable for this source.",
-                )
-            if not state.tabular_selector.selected_regions:
-                raise HTTPException(
-                    status_code=400,
-                    detail="No tabular regions are available to re-infer the range.",
-                )
-            note_text = answer_text.strip()
-            if not note_text:
-                raise HTTPException(
-                    status_code=400,
-                    detail="Add a note describing how the range should change.",
-                )
-            await _apply_tabular_range_proposal(
-                state,
-                state.tabular_selector,
-                selected_regions=state.tabular_selector.selected_regions,
-                instruction=note_text,
-                activity_title="Range re-proposal",
-            )
-            await _broadcast_plot_mode_state(state)
-            return {"status": "ok", "plot_mode": state.model_dump(mode="json")}
-
-        if pending.purpose == "confirm_data_preview":
-            profile_id = pending.source_ids[0] if pending.source_ids else ""
-            profile = next(
-                (
-                    profile
-                    for profile in state.data_profiles
-                    if profile.id == profile_id
-                ),
-                None,
-            )
-            if profile is None:
-                raise HTTPException(
-                    status_code=400,
-                    detail="The previewed data source is no longer available.",
-                )
-
-            decision = first_option_ids[0] if first_option_ids else ""
-            answer_text = first_answer_text or ""
-            if not decision and answer_text:
-                lowered = answer_text.lower()
-                if any(
-                    token in lowered for token in ["use", "yes", "confirm", "correct"]
-                ):
-                    decision = "use_preview"
-                elif any(
-                    token in lowered
-                    for token in ["adjust", "different", "change", "another"]
-                ):
-                    if (
-                        state.tabular_selector is not None
-                        and profile.source_file_id == state.tabular_selector.file_id
-                    ):
-                        decision = "adjust_selection"
-                    else:
-                        decision = "choose_other_source"
-
-            if decision not in {
-                "use_preview",
-                "adjust_selection",
-                "choose_other_source",
-            }:
-                raise HTTPException(
-                    status_code=400,
-                    detail="Confirm the preview or choose how to adjust the source.",
-                )
-
-            state.pending_question_set = None
-            _mark_question_set_answered(
-                state,
-                body.question_set_id,
-                answered_questions=answered_questions,
-            )
-
-            if decision == "use_preview":
-                ok, error_message = await _start_plot_mode_planning_for_profile(
-                    state,
-                    profile,
-                )
-                if not ok:
-                    return {
-                        "status": "error",
-                        "plot_mode": state.model_dump(mode="json"),
-                        "error": error_message or "Planning failed",
-                    }
-                return {"status": "ok", "plot_mode": state.model_dump(mode="json")}
-
-            _clear_selected_plot_mode_source_context(state)
-            if decision == "adjust_selection":
-                if state.tabular_selector is None:
-                    raise HTTPException(
-                        status_code=400,
-                        detail="Range selection is unavailable for this source.",
-                    )
-                state.tabular_selector.requires_user_hint = True
-                state.tabular_selector.inferred_profile_id = None
-                state.phase = PlotModePhase.awaiting_data_choice
-                await _broadcast_plot_mode_state(state)
-                return {"status": "ok", "plot_mode": state.model_dump(mode="json")}
-
-            state.phase = PlotModePhase.awaiting_data_choice
-            question_set = PlotModeQuestionSet(
-                purpose="select_data_source",
-                title="Choose a source",
-                source_ids=[profile.id for profile in state.data_profiles],
-            )
-            options = [
-                PlotModeQuestionOption(
-                    id=item.id,
-                    label=item.source_label,
-                    description=(
-                        ", ".join(item.columns[:4]) if item.columns else item.summary
-                    ),
-                )
-                for item in state.data_profiles[:8]
-            ]
-            question_set.questions = [
-                PlotModeQuestionItem(
-                    title="Available sources",
-                    prompt="Which data source should I preview next?",
-                    options=options,
-                    allow_custom_answer=True,
-                )
-            ]
-            _append_plot_mode_question_set(
-                state,
-                question_set=question_set,
-                lead_content="Which data source should I preview next?",
-            )
-            await _broadcast_plot_mode_state(state)
-            return {"status": "ok", "plot_mode": state.model_dump(mode="json")}
-
-        if pending.purpose == "continue_plot_planning":
-            decision = first_option_ids[0] if first_option_ids else ""
-            answer_text = first_answer_text or ""
-            if not decision and answer_text:
-                lowered = answer_text.lower()
-                if any(
-                    token in lowered for token in ["approve", "continue", "go", "yes"]
-                ):
-                    decision = "continue_planning"
-                elif any(token in lowered for token in ["revise", "change", "adjust"]):
-                    decision = "revise_goal"
-
-            if decision not in {"continue_planning", "revise_goal"} and answer_summary:
-                lowered_summary = answer_summary.lower()
-                if any(
-                    token in lowered_summary for token in ["revise", "change", "adjust"]
-                ):
-                    decision = "revise_goal"
-                else:
-                    decision = "continue_planning"
-
-            if decision not in {"continue_planning", "revise_goal"}:
-                raise HTTPException(
-                    status_code=400,
-                    detail="Choose whether to continue planning or revise the goal.",
-                )
-
-            state.pending_question_set = None
-            _mark_question_set_answered(
-                state,
-                body.question_set_id,
-                answered_questions=answered_questions,
-            )
-
-            if decision == "revise_goal":
-                state.phase = PlotModePhase.awaiting_prompt
-                if answer_summary:
-                    _append_plot_mode_message(
-                        state, role="user", content=answer_summary
-                    )
-                await _broadcast_plot_mode_state(state)
-                return {"status": "ok", "plot_mode": state.model_dump(mode="json")}
-
-            approval_message = answer_summary or answer_text or "Approved. Continue."
-            _append_plot_mode_message(state, role="user", content=approval_message)
-
-            planning_message = (
-                state.latest_user_goal.strip()
-                or state.latest_plan_summary.strip()
-                or approval_message
-            )
-            if answer_summary:
-                planning_message = (
-                    f"{planning_message}\n\nUser answers:\n{answer_summary}"
-                )
-
-            ok, error_message = await _continue_plot_mode_planning_with_selected_runner(
-                state=state,
-                planning_message=planning_message,
-            )
-            if not ok:
-                return {
-                    "status": "error",
-                    "plot_mode": state.model_dump(mode="json"),
-                    "error": error_message or "Planning failed",
-                }
-            return {"status": "ok", "plot_mode": state.model_dump(mode="json")}
-
-        if pending.purpose == "kickoff_plot_planning":
-            decision = first_option_ids[0] if first_option_ids else ""
-            answer_text = (first_answer_text or "").strip()
-            if not decision and answer_text:
-                lowered = answer_text.lower()
-                if any(
-                    token in lowered for token in ["proceed", "continue", "go", "yes"]
-                ):
-                    decision = "proceed_to_planning"
-                else:
-                    decision = "custom_guidance"
-
-            if decision not in {"proceed_to_planning", "custom_guidance"}:
-                raise HTTPException(
-                    status_code=400,
-                    detail="Choose whether to proceed to planning or add guidance first.",
-                )
-
-            state.pending_question_set = None
-            _mark_question_set_answered(
-                state,
-                body.question_set_id,
-                answered_questions=answered_questions,
-            )
-
-            planning_message = answer_text or "Proceed to plot planning."
-            state.latest_user_goal = planning_message
-            _append_plot_mode_message(state, role="user", content=planning_message)
-
-            ok, error_message = await _continue_plot_mode_planning_with_selected_runner(
-                state=state,
-                planning_message=planning_message,
-            )
-            if not ok:
-                return {
-                    "status": "error",
-                    "plot_mode": state.model_dump(mode="json"),
-                    "error": error_message or "Planning failed",
-                }
-            return {"status": "ok", "plot_mode": state.model_dump(mode="json")}
-
-        if pending.purpose == "approve_plot_plan":
-            decision = first_option_ids[0] if first_option_ids else ""
-            answer_text = first_answer_text or ""
-            if not decision and answer_text:
-                lowered = answer_text.lower()
-                if any(token in lowered for token in ["start", "go", "yes", "approve"]):
-                    decision = "start_draft"
-                elif any(token in lowered for token in ["revise", "change", "adjust"]):
-                    decision = "revise_plan"
-
-            if decision not in {"start_draft", "revise_plan"} and answer_summary:
-                lowered_summary = answer_summary.lower()
-                if any(
-                    token in lowered_summary for token in ["revise", "change", "adjust"]
-                ):
-                    decision = "revise_plan"
-                else:
-                    decision = "start_draft"
-
-            if decision not in {"start_draft", "revise_plan"}:
-                raise HTTPException(
-                    status_code=400,
-                    detail="Choose whether to start drafting or revise the plan.",
-                )
-
-            state.pending_question_set = None
-            _mark_question_set_answered(
-                state,
-                body.question_set_id,
-                answered_questions=answered_questions,
-            )
-
-            if decision == "revise_plan":
-                state.phase = PlotModePhase.awaiting_prompt
-                if answer_summary:
-                    _append_plot_mode_message(
-                        state, role="user", content=answer_summary
-                    )
-                _append_plot_mode_message(
-                    state,
-                    role="assistant",
-                    content=(
-                        "Got it. Tell me what to adjust in plot type, style, data scope, or layout, "
-                        "and I will update the plan."
-                    ),
-                )
-                await _broadcast_plot_mode_state(state)
-                return {"status": "ok", "plot_mode": state.model_dump(mode="json")}
-
-            approval_message = (
-                answer_summary or answer_text or "Approved. Start drafting now."
-            )
-            _append_plot_mode_message(state, role="user", content=approval_message)
-
-            runner = _resolve_available_runner(
-                _normalize_fix_runner(
-                    state.selected_runner, default=_default_fix_runner
-                )
-            )
-            state.selected_runner = runner
-            _ensure_runner_is_available(runner)
-            model = str(state.selected_model or "").strip() or _runner_default_model_id(
-                runner
-            )
-            normalized_variant = (
-                str(state.selected_variant).strip() if state.selected_variant else ""
-            )
-            variant = normalized_variant or None
-
-            draft_message = (
-                state.latest_user_goal or state.latest_plan_summary or approval_message
-            )
-            if answer_summary:
-                draft_message = f"{draft_message}\n\nUser answers:\n{answer_summary}"
-
-            ok, error_message = await _execute_plot_mode_draft(
-                state=state,
-                runner=runner,
-                model=model,
-                variant=variant,
-                draft_message=draft_message,
-            )
-            if not ok:
-                return {
-                    "status": "error",
-                    "plot_mode": state.model_dump(mode="json"),
-                    "error": error_message or "Plot generation failed",
-                }
-            return {"status": "ok", "plot_mode": state.model_dump(mode="json")}
-
-        raise HTTPException(
-            status_code=400, detail="Unsupported plot-mode question type"
-        )
-
-    @app.post("/api/plot-mode/chat")
-    async def run_plot_mode_chat(body: PlotModeChatRequest, request: Request):
-        runtime = cast(BackendRuntime, request.app.state.runtime)
-
-        async def _chat() -> dict[str, object]:
-            _ensure_session_store_loaded()
-            if _runtime_active_session_value() is not None:
-                raise HTTPException(
-                    status_code=409,
-                    detail="Annotation mode is active; plot mode chat is unavailable.",
-                )
-
-            state = _resolve_plot_mode_workspace(body.workspace_id)
-            if state.phase == PlotModePhase.awaiting_files or not state.files:
-                raise HTTPException(
-                    status_code=409,
-                    detail="Select dataset files before starting chat.",
-                )
-            if state.pending_question_set is not None:
-                raise HTTPException(
-                    status_code=409,
-                    detail="Answer the pending plot-mode confirmation before sending a new prompt.",
-                )
-            if (
-                state.tabular_selector is not None
-                and state.tabular_selector.requires_user_hint
-            ):
-                raise HTTPException(
-                    status_code=409,
-                    detail="Mark the relevant cells in the tabular selector before continuing.",
-                )
-            if (
-                _selected_data_profile(state) is None
-                and state.data_profiles
-                and not state.active_resolved_source_ids
-            ):
-                raise HTTPException(
-                    status_code=409,
-                    detail="Choose the data source to plot before drafting a figure.",
-                )
-
-            message = body.message.strip()
-            if not message:
-                raise HTTPException(status_code=400, detail="Missing message")
-
-            runner = _resolve_available_runner(
-                _normalize_fix_runner(
-                    body.runner or state.selected_runner,
-                    default=_default_fix_runner,
-                )
-            )
-            state.selected_runner = runner
-            _ensure_runner_is_available(runner)
-            model = str(body.model or state.selected_model or "").strip()
-            if not model:
-                model = _runner_default_model_id(runner)
-
-            variant_raw = body.variant
-            variant = str(variant_raw).strip() if variant_raw is not None else ""
-            normalized_variant = variant or None
-
-            try:
-                available_models = await asyncio.to_thread(
-                    _refresh_runner_models_cache,
-                    runner,
-                )
-            except RuntimeError:
-                available_models = []
-
-            if not body.model and available_models:
-                selected_model = next(
-                    (entry for entry in available_models if entry.id == model),
-                    None,
-                )
-                if selected_model is None:
-                    resolved_model, resolved_variant = (
-                        _resolve_runner_default_model_and_variant(
-                            runner=runner,
-                            models=available_models,
-                            preferred_runner=runner,
-                            preferred_model=model,
-                            preferred_variant=normalized_variant,
-                        )
-                    )
-                    model = resolved_model or model
-                    if normalized_variant and resolved_variant:
-                        normalized_variant = resolved_variant
-                    elif selected_model is None:
-                        normalized_variant = ""
-
-            _validate_runner_model_selection(
-                runner=runner,
-                model=model,
-                variant=normalized_variant,
-                models=available_models,
-            )
-
-            state.selected_runner = runner
-            state.selected_model = model
-            state.selected_variant = normalized_variant or ""
-            state.latest_user_goal = message
-            state.last_error = None
-            _promote_plot_mode_workspace(state)
-            _append_plot_mode_message(state, role="user", content=message)
-            ok, error_message = await _continue_plot_mode_planning(
-                state=state,
-                runner=runner,
-                model=model,
-                variant=normalized_variant,
-                planning_message=message,
-            )
-            if not ok:
-                return {
-                    "status": "error",
-                    "plot_mode": state.model_dump(mode="json"),
-                    "error": error_message or "Planning failed",
-                }
-
-            return {
-                "status": "ok",
-                "plot_mode": state.model_dump(mode="json"),
-            }
-
-        return await _with_runtime_async(runtime, _chat)
-
-    @app.post("/api/plot-mode/finalize")
-    async def finalize_plot_mode(body: PlotModeFinalizeRequest, request: Request):
-        runtime = cast(BackendRuntime, request.app.state.runtime)
-
-        def _finalize() -> tuple[PlotSession, dict[str, object]]:
-            _ensure_session_store_loaded()
-            if _runtime_active_session_value() is not None:
-                session = get_session()
-                _rebuild_revision_history(session)
-                return session, _bootstrap_payload(
-                    mode="annotation", session=session, plot_mode=None
-                )
-
-            state = _resolve_plot_mode_workspace(body.workspace_id)
-            script = (state.current_script or "").strip()
-            if not script:
-                raise HTTPException(
-                    status_code=409,
-                    detail="No generated script is available yet.",
-                )
-
-            script_path = _plot_mode_generated_script_path(state)
-            script_path.write_text(script, encoding="utf-8")
-
-            annotation_session_id = _new_id()
-
-            result = init_session_from_script(
-                script_path,
-                inherit_id=annotation_session_id,
-                inherit_workspace_id=state.id,
-                inherit_workspace_name=state.workspace_name or None,
-                inherit_artifacts_root=str(_plot_mode_artifacts_dir(state)),
-                runtime=runtime,
-            )
-            if not result.success:
-                raise HTTPException(
-                    status_code=422,
-                    detail={
-                        "error": result.error,
-                        "stderr": result.stderr,
-                        "stdout": result.stdout,
-                    },
-                )
-
-            session = get_session()
-            _rebuild_revision_history(session)
-            return session, _bootstrap_payload(
-                mode="annotation", session=session, plot_mode=None
-            )
-
-        session, payload = _with_runtime(runtime, _finalize)
-        await _broadcast(
-            {
-                "type": "plot_mode_completed",
-                "session": session.model_dump(mode="json"),
-            }
-        )
-        return payload
-
-    @app.patch("/api/plot-mode/workspace")
-    async def rename_plot_mode_workspace(request: Request):
-        runtime = cast(BackendRuntime, request.app.state.runtime)
-        body = await request.json()
-
-        def _rename() -> dict[str, object]:
-            _ensure_session_store_loaded()
-            requested_id: str | None = (
-                body.get("id") if isinstance(body, dict) else None
-            )
-            raw_name = (
-                (body.get("workspace_name") or body.get("name") or "")
-                if isinstance(body, dict)
-                else ""
-            )
-
-            active_plot_mode = _runtime_plot_mode_state_value()
-            if requested_id and (
-                active_plot_mode is None or active_plot_mode.id != requested_id
-            ):
-                state = _load_plot_mode_workspace_by_id(requested_id)
-                if state is None:
-                    raise HTTPException(
-                        status_code=404,
-                        detail=f"Plot-mode workspace not found: {requested_id}",
-                    )
-            else:
-                state = _get_plot_mode_state()
-
-            _promote_plot_mode_workspace(state)
-            state.workspace_name = normalize_workspace_name(raw_name)
-            _touch_plot_mode(state)
-            workspace_path = _plot_mode_workspace_snapshot_path(state)
-            payload = cast(dict[str, object], state.model_dump(mode="json"))
-            _write_json_atomic(workspace_path, payload)
-            return {"status": "ok", "plot_mode": state.model_dump(mode="json")}
-
-        return _with_runtime(runtime, _rename)
-
-    @app.delete("/api/plot-mode")
-    async def delete_plot_mode_workspace(request: Request):
-        runtime = cast(BackendRuntime, request.app.state.runtime)
-
-        requested_id: str | None = None
-        try:
-            body = await request.json()
-            if isinstance(body, dict):
-                requested_id = body.get("id")
-        except Exception:
-            pass
-
-        def _delete() -> dict[str, object]:
-            _ensure_session_store_loaded()
-            active_plot_mode = _runtime_plot_mode_state_value()
-
-            if requested_id and (
-                active_plot_mode is None or active_plot_mode.id != requested_id
-            ):
-                target = _load_plot_mode_workspace_by_id(requested_id)
-                if target is None:
-                    raise HTTPException(
-                        status_code=404,
-                        detail=f"Plot-mode workspace not found: {requested_id}",
-                    )
-                _delete_plot_mode_snapshot(state=target, clear_active_snapshot=False)
-            else:
-                if active_plot_mode is None:
-                    raise HTTPException(
-                        status_code=404, detail="No active plot-mode workspace"
-                    )
-                doomed = active_plot_mode
-                _reset_plot_mode_runtime_state()
-                _delete_plot_mode_snapshot(state=doomed, clear_active_snapshot=True)
-
-            active_session = _runtime_active_session_value()
-            active_plot_mode = _runtime_plot_mode_state_value()
-            if active_session is not None:
-                session = get_session()
-                _rebuild_revision_history(session)
-                return _bootstrap_payload(
-                    mode="annotation", session=session, plot_mode=None
-                )
-
-            if active_plot_mode is not None:
-                return _bootstrap_payload(
-                    mode="plot", session=None, plot_mode=active_plot_mode
-                )
-
-            state = init_plot_mode_session(workspace_dir=None)
-            return _bootstrap_payload(mode="plot", session=None, plot_mode=state)
-
-        return _with_runtime(runtime, _delete)
-
-    @app.post("/api/plot-mode/activate")
-    async def activate_plot_mode(request: Request):
-        runtime = cast(BackendRuntime, request.app.state.runtime)
-
-        requested_id: str | None = None
-        try:
-            body = await request.json()
-            if isinstance(body, dict):
-                requested_id = body.get("id")
-        except Exception:
-            pass
-
-        def _activate() -> dict[str, object]:
-            _ensure_session_store_loaded()
-            active_plot_mode = _runtime_plot_mode_state_value()
-            if requested_id and (
-                active_plot_mode is None or active_plot_mode.id != requested_id
-            ):
-                target = _load_plot_mode_workspace_by_id(requested_id)
-                if target is None:
-                    raise HTTPException(
-                        status_code=404,
-                        detail=f"Plot-mode workspace not found: {requested_id}",
-                    )
-                if active_plot_mode is not None:
-                    _clear_plot_mode_state()
-                runtime.store.plot_mode = target
-                _sync_globals_from_runtime(runtime)
-                _save_plot_mode_snapshot(target)
-
-            state = _get_plot_mode_state()
-            _set_active_session(None, clear_plot_mode=False)
-            set_workspace_dir(Path(state.workspace_dir))
-            return _bootstrap_payload(mode="plot", session=None, plot_mode=state)
-
-        return _with_runtime(runtime, _activate)
-
-    @app.get("/api/session")
-    async def get_session_state(session_id: str | None = None):
-        session = _resolve_request_session(session_id)
-        _rebuild_revision_history(session)
-        return session.model_dump()
-
-    @app.get("/api/sessions")
-    async def list_sessions(request: Request):
-        runtime = cast(BackendRuntime, request.app.state.runtime)
-
-        def _list() -> dict[str, object]:
-            _ensure_session_store_loaded()
-            active_session = _runtime_active_session_value()
-            return {
-                "sessions": _list_session_summaries(),
-                "active_session_id": _runtime_active_session_id_value(),
-                "active_workspace_id": _active_workspace_id(),
-                "mode": "annotation" if active_session is not None else "plot",
-            }
-
-        return _with_runtime(runtime, _list)
-
-    @app.post("/api/sessions/new")
-    async def create_new_session(request: Request):
-        runtime = cast(BackendRuntime, request.app.state.runtime)
-        state = _with_runtime(
-            runtime,
-            lambda: init_plot_mode_session(workspace_dir=None, persist_workspace=True),
-        )
-        await _broadcast(
-            {
-                "type": "plot_mode_updated",
-                "plot_mode": state.model_dump(mode="json"),
-            }
-        )
-        return _with_runtime(
-            runtime,
-            lambda: _bootstrap_payload(mode="plot", session=None, plot_mode=state),
-        )
-
-    @app.post("/api/sessions/{session_id}/activate")
-    async def activate_session(session_id: str, request: Request):
-        runtime = cast(BackendRuntime, request.app.state.runtime)
-
-        def _activate_session_request() -> tuple[PlotSession, dict[str, object]]:
-            _ensure_session_store_loaded()
-
-            session = _runtime_sessions_map().get(session_id)
-            if session is None:
-                raise HTTPException(
-                    status_code=404, detail=f"Session not found: {session_id}"
-                )
-
-            _set_active_session(session_id, clear_plot_mode=False)
-            active_session = get_session()
-            _rebuild_revision_history(active_session)
-            _touch_session(active_session)
-            _persist_session(active_session, promote=True)
-            return active_session, _bootstrap_payload(
-                mode="annotation",
-                session=active_session,
-                plot_mode=None,
-            )
-
-        active_session, payload = _with_runtime(runtime, _activate_session_request)
-
-        await _broadcast(
-            {
-                "type": "plot_updated",
-                "session_id": active_session.id,
-                "version_id": active_session.checked_out_version_id,
-                "plot_type": active_session.plot_type,
-                "revision": len(active_session.revision_history),
-                "active_branch_id": active_session.active_branch_id,
-                "checked_out_version_id": active_session.checked_out_version_id,
-                "reason": "session_switch",
-            }
-        )
-
-        return payload
-
-    @app.patch("/api/sessions/{session_id}")
-    async def rename_session(
-        session_id: str,
-        body: RenameSessionRequest,
-        request: Request,
-    ):
-        runtime = cast(BackendRuntime, request.app.state.runtime)
-
-        def _rename_session_request() -> dict[str, object]:
-            _ensure_session_store_loaded()
-
-            target = _runtime_sessions_map().get(session_id)
-            if target is None:
-                raise HTTPException(
-                    status_code=404, detail=f"Session not found: {session_id}"
-                )
-
-            raw_name = (
-                body.workspace_name if body.workspace_name is not None else body.name
-            )
-            next_name = normalize_workspace_name(raw_name)
-
-            target.workspace_name = next_name
-            _touch_session(target)
-            _persist_session(target, promote=True)
-
-            workspace_id = _session_workspace_id(target)
-            active_plot_mode = _runtime_plot_mode_state_value()
-            if active_plot_mode is not None and active_plot_mode.id == workspace_id:
-                active_plot_mode.workspace_name = next_name
-                _touch_plot_mode(active_plot_mode)
-            else:
-                persisted_plot_mode = _load_plot_mode_workspace_by_id(workspace_id)
-                if persisted_plot_mode is not None:
-                    persisted_plot_mode.workspace_name = next_name
-                    _touch_plot_mode(persisted_plot_mode)
-
-            return {
-                "status": "ok",
-                "workspace": _session_summary(target),
-                "active_session_id": _runtime_active_session_id_value(),
-            }
-
-        return _with_runtime(runtime, _rename_session_request)
-
-    @app.delete("/api/sessions/{session_id}")
-    async def delete_session(session_id: str, request: Request):
-        runtime = cast(BackendRuntime, request.app.state.runtime)
-
-        def _load_delete_context() -> tuple[PlotSession, list[FixJob]]:
-            _ensure_session_store_loaded()
-            target = _runtime_sessions_map().get(session_id)
-            if target is None:
-                raise HTTPException(
-                    status_code=404,
-                    detail=f"Session not found: {session_id}",
-                )
-            jobs = [
-                job
-                for job in _runtime_fix_jobs_map().values()
-                if job.session_id == session_id
-            ]
-            return target, jobs
-
-        target, jobs_to_cancel = _with_runtime(runtime, _load_delete_context)
-        for job in jobs_to_cancel:
-            await _with_runtime_async(
-                runtime,
-                lambda job=job: _cancel_fix_job_execution(
-                    job, reason="Workspace deleted"
-                ),
-            )
-
-        def _delete_session_request() -> dict[str, object]:
-            fix_jobs = _runtime_fix_jobs_map()
-            fix_job_tasks = _runtime_fix_job_tasks_map()
-            fix_job_processes = _runtime_fix_job_processes_map()
-            sessions = _runtime_sessions_map()
-            runtime_session_order = (
-                _session_order
-                if _runtime_is_shared(runtime)
-                else runtime.store.session_order
-            )
-            workspace_id = _session_workspace_id(target)
-            active_plot_mode = _runtime_plot_mode_state_value()
-            active_session = _runtime_active_session_value()
-
-            for job in jobs_to_cancel:
-                fix_jobs.pop(job.id, None)
-                fix_job_tasks.pop(job.id, None)
-                fix_job_processes.pop(job.id, None)
-
-            _clear_active_fix_job_for_session(session_id)
-
-            session_dir = _sessions_root_dir() / session_id
-            artifacts_root = _session_artifacts_root(target)
-            shutil.rmtree(session_dir, ignore_errors=True)
-            if artifacts_root != session_dir and _is_managed_workspace_path(
-                artifacts_root
-            ):
-                shutil.rmtree(artifacts_root, ignore_errors=True)
-            if active_plot_mode is not None and active_plot_mode.id == workspace_id:
-                _reset_plot_mode_runtime_state()
-            _delete_plot_mode_snapshot(
-                state=PlotModeState(
-                    id=workspace_id,
-                    workspace_dir=str(_plot_mode_artifacts_path_for_id(workspace_id)),
-                )
-            )
-
-            sessions.pop(session_id, None)
-            runtime_session_order[:] = [
-                sid for sid in runtime_session_order if sid != session_id
-            ]
-
-            deleted_active = _runtime_active_session_id_value() == session_id or (
-                active_session is not None and active_session.id == session_id
-            )
-
-            if deleted_active:
-                if _runtime_is_shared(runtime):
-                    global _active_session_id, _session
-                    _active_session_id = None
-                    _session = None
-                else:
-                    runtime.store.active_session_id = None
-                    runtime.store.active_session = None
-
-                next_session_id = next(
-                    (sid for sid in runtime_session_order if sid in sessions),
-                    None,
-                )
-                if next_session_id is not None:
-                    _set_active_session(next_session_id, clear_plot_mode=True)
-                    next_active_session = get_session()
-                    _rebuild_revision_history(next_active_session)
-                    _touch_session(next_active_session)
-                    _persist_session(next_active_session, promote=True)
-                    return _bootstrap_payload(
-                        mode="annotation",
-                        session=next_active_session,
-                        plot_mode=None,
-                    )
-
-                _save_session_registry()
-                state = _runtime_plot_mode_state_value() or init_plot_mode_session(
-                    workspace_dir=None
-                )
-                return _bootstrap_payload(mode="plot", session=None, plot_mode=state)
-
-            _save_session_registry()
-            remaining_active_session = _runtime_active_session_value()
-            if remaining_active_session is not None:
-                active_session = get_session()
-                _rebuild_revision_history(active_session)
-                return _bootstrap_payload(
-                    mode="annotation",
-                    session=active_session,
-                    plot_mode=None,
-                )
-
-            state = _runtime_plot_mode_state_value() or init_plot_mode_session(
-                workspace_dir=None
-            )
-            return _bootstrap_payload(mode="plot", session=None, plot_mode=state)
-
-        return _with_runtime(runtime, _delete_session_request)
-
-    @app.get("/api/preferences")
-    async def get_preferences():
-        fix_runner, fix_model, fix_variant = _load_fix_preferences()
-        return {
-            "fix_runner": fix_runner,
-            "fix_model": fix_model,
-            "fix_variant": fix_variant,
-        }
-
-    @app.post("/api/preferences")
-    async def set_preferences(body: PreferencesRequest):
-        current_runner, current_model, current_variant = _load_fix_preferences()
-
-        runner = _normalize_fix_runner(
-            body.fix_runner,
-            default=current_runner,
-        )
-
-        model: str | None
-        if "fix_model" in body.model_fields_set:
-            model_raw = body.fix_model
-            model_candidate = str(model_raw).strip() if model_raw is not None else ""
-            model = model_candidate or None
-        else:
-            model = current_model
-
-        if model is None:
-            variant = None
-        elif "fix_variant" in body.model_fields_set:
-            variant_raw = body.fix_variant
-            variant_candidate = (
-                str(variant_raw).strip() if variant_raw is not None else ""
-            )
-            variant = variant_candidate or None
-        else:
-            variant = current_variant
-
-        try:
-            models = await asyncio.to_thread(_refresh_runner_models_cache, runner)
-        except RuntimeError:
-            models = []
-
-        if model:
-            _validate_runner_model_selection(
-                runner=runner,
-                model=model,
-                variant=variant,
-                models=models,
-            )
-
-        try:
-            await asyncio.to_thread(
-                _save_fix_preferences,
-                runner=runner,
-                model=model,
-                variant=variant,
-            )
-        except OSError as exc:
-            raise HTTPException(
-                status_code=500,
-                detail=f"Failed to save preferences: {exc}",
-            ) from exc
-        return {
-            "status": "ok",
-            "fix_runner": runner,
-            "fix_model": model,
-            "fix_variant": variant,
-        }
-
-    @app.get("/api/runners")
-    async def get_runners():
-        availability = await asyncio.to_thread(_detect_runner_availability)
-        return {
-            "available_runners": availability["available_runners"],
-            "supported_runners": availability["supported_runners"],
-            "claude_code_available": availability["claude_code_available"],
-        }
-
-    @app.get("/api/runners/status")
-    async def get_runner_status():
-        return await asyncio.to_thread(_build_runner_status_payload)
-
-    @app.post("/api/runners/install")
-    async def install_runner(body: RunnerInstallRequest, request: Request):
-        payload = await asyncio.to_thread(_build_runner_status_payload)
-        runner_entries = cast(list[dict[str, object]], payload.get("runners") or [])
-        entry = next(
-            (item for item in runner_entries if item.get("runner") == body.runner), None
-        )
-        if entry is None:
-            raise HTTPException(status_code=404, detail="Unknown runner")
-        if entry.get("primary_action") != "install":
-            raise HTTPException(
-                status_code=409,
-                detail=(
-                    f"Runner '{body.runner}' does not support click-install on this machine. "
-                    f"Use the guide instead: {entry.get('guide_url')}"
-                ),
-            )
-        job = await asyncio.to_thread(
-            _create_runner_install_job,
-            body.runner,
-            runtime=cast(BackendRuntime, request.app.state.runtime),
-        )
-        return {"job": job}
-
-    @app.post("/api/runners/auth/launch")
-    async def launch_runner_auth(body: RunnerAuthLaunchRequest):
-        payload = await asyncio.to_thread(_build_runner_status_payload)
-        runner_entries = cast(list[dict[str, object]], payload.get("runners") or [])
-        entry = next(
-            (item for item in runner_entries if item.get("runner") == body.runner), None
-        )
-        if entry is None:
-            raise HTTPException(status_code=404, detail="Unknown runner")
-        if entry.get("primary_action") != "authenticate":
-            raise HTTPException(
-                status_code=409,
-                detail=(
-                    f"Runner '{body.runner}' is not waiting for Terminal authentication on this machine."
-                ),
-            )
-        await asyncio.to_thread(_launch_runner_auth_terminal, body.runner)
-        return {
-            "status": "ok",
-            "auth_command": entry.get("auth_command"),
-            "auth_instructions": entry.get("auth_instructions"),
-        }
-
-    @app.post("/api/open-external-url")
-    async def open_external_url(body: OpenExternalUrlRequest):
-        url = body.url.strip()
-        if not url.startswith(("https://", "http://")):
-            raise HTTPException(
-                status_code=400, detail="Only http(s) URLs are supported"
-            )
-        await asyncio.to_thread(webbrowser.open, url)
-        return {"status": "ok"}
-
-    @app.post("/api/update-status/refresh")
-    async def refresh_update_status(request: Request):
-        runtime = cast(BackendRuntime, request.app.state.runtime)
-        return await asyncio.to_thread(
-            build_update_status_payload,
-            runtime,
-            allow_network=True,
-            force_refresh=True,
-        )
-
-    @app.get("/api/python/interpreter")
-    async def get_python_interpreter(request: Request, session_id: str | None = None):
-        runtime = cast(BackendRuntime, request.app.state.runtime)
-
-        def _resolve_session_for_python() -> PlotSession | None:
-            _ensure_session_store_loaded()
-            return (
-                _resolve_request_session(session_id)
-                if session_id is not None
-                else _runtime_active_session_value()
-            )
-
-        session = _with_runtime(runtime, _resolve_session_for_python)
-        return await asyncio.to_thread(_resolve_python_interpreter_state, session)
-
-    @app.post("/api/python/interpreter")
-    async def set_python_interpreter(body: PythonInterpreterRequest, request: Request):
-        runtime = cast(BackendRuntime, request.app.state.runtime)
-        _with_runtime(runtime, lambda: _ensure_session_store_loaded())
-        mode = body.mode
-        if mode not in {"builtin", "manual", "auto"}:
-            raise HTTPException(
-                status_code=400,
-                detail="Mode must be 'builtin' or 'manual'",
-            )
-
-        if mode in {"builtin", "auto"}:
-            try:
-                await asyncio.to_thread(_save_python_interpreter_preference, None)
-            except OSError as exc:
-                raise HTTPException(
-                    status_code=500,
-                    detail=f"Failed to save interpreter preference: {exc}",
-                ) from exc
-            session = _with_runtime(runtime, _runtime_active_session_value)
-            return await asyncio.to_thread(_resolve_python_interpreter_state, session)
-
-        path_raw = body.path
-        path = str(path_raw).strip() if path_raw is not None else ""
-        if not path:
-            raise HTTPException(
-                status_code=400,
-                detail="Missing interpreter path for manual mode",
-            )
-
-        candidate, validation_error = await asyncio.to_thread(
-            lambda: _validated_python_candidate(Path(path), source="manual")
-        )
-        if candidate is None:
-            raise HTTPException(
-                status_code=400,
-                detail=validation_error or "Invalid interpreter path",
-            )
-
-        try:
-            await asyncio.to_thread(
-                _save_python_interpreter_preference,
-                candidate["path"],
-            )
-        except OSError as exc:
-            raise HTTPException(
-                status_code=500,
-                detail=f"Failed to save interpreter preference: {exc}",
-            ) from exc
-
-        session = _with_runtime(runtime, _runtime_active_session_value)
-        return await asyncio.to_thread(_resolve_python_interpreter_state, session)
-
-    @app.get("/api/runners/models")
-    async def get_runner_models(runner: str = "opencode", force_refresh: bool = False):
-        normalized_runner = _normalize_fix_runner(runner, default=_default_fix_runner)
-        _ensure_runner_is_available(normalized_runner)
-        fallback_to_empty_models = False
-        try:
-            models = await asyncio.to_thread(
-                _refresh_runner_models_cache,
-                normalized_runner,
-                force_refresh=force_refresh,
-            )
-        except RuntimeError as exc:
-            if (
-                normalized_runner == "codex"
-                and "model cache not found" in str(exc).lower()
-            ):
-                models = []
-                fallback_to_empty_models = True
-            else:
-                raise HTTPException(
-                    status_code=503,
-                    detail=f"Failed to load models from {normalized_runner}: {exc}",
-                ) from exc
-
-        preferred_runner, preferred_model, preferred_variant = await asyncio.to_thread(
-            _load_fix_preferences
-        )
-        if fallback_to_empty_models and preferred_runner != normalized_runner:
-            preferred_model = _runner_default_model_id(normalized_runner)
-            preferred_variant = None
-        default_model, default_variant = _resolve_runner_default_model_and_variant(
-            runner=normalized_runner,
-            models=models,
-            preferred_runner=preferred_runner,
-            preferred_model=preferred_model,
-            preferred_variant=preferred_variant,
-        )
-
-        return {
-            "runner": normalized_runner,
-            "models": [model.model_dump() for model in models],
-            "default_model": default_model,
-            "default_variant": default_variant,
-        }
-
-    @app.get("/api/opencode/models")
-    async def get_opencode_models(force_refresh: bool = False):
-        payload = await get_runner_models(
-            runner="opencode", force_refresh=force_refresh
-        )
-        return {
-            "models": payload["models"],
-            "default_model": payload["default_model"],
-            "default_variant": payload["default_variant"],
-        }
-
-    @app.get("/api/fix-jobs")
-    async def list_fix_jobs(
-        request: Request,
-        limit: int = 20,
-        session_id: str | None = None,
-    ):
-        runtime = cast(BackendRuntime, request.app.state.runtime)
-        await _reconcile_active_fix_job_state()
-        bounded_limit = max(1, min(limit, 100))
-        fix_jobs = _runtime_fix_jobs_map()
-
-        normalized_session_id = (
-            session_id.strip()
-            if session_id is not None and session_id.strip()
-            else None
-        )
-        filtered_jobs = (
-            [
-                job
-                for job in fix_jobs.values()
-                if job.session_id == normalized_session_id
-            ]
-            if normalized_session_id
-            else list(fix_jobs.values())
-        )
-
-        sorted_jobs = sorted(
-            filtered_jobs,
-            key=lambda job: job.created_at,
-            reverse=True,
-        )
-
-        effective_session_id = normalized_session_id
-        if effective_session_id is None:
-            effective_session_id = runtime.store.active_session_id
-            if (
-                effective_session_id is None
-                and runtime.store.active_session is not None
-            ):
-                effective_session_id = runtime.store.active_session.id
-
-        return {
-            "active_job_id": _active_fix_job_id_for_session(effective_session_id),
-            "jobs": [
-                job.model_dump(mode="json") for job in sorted_jobs[:bounded_limit]
-            ],
-        }
-
-    @app.get("/api/fix-jobs/current")
-    async def get_current_fix_job(request: Request, session_id: str | None = None):
-        runtime = cast(BackendRuntime, request.app.state.runtime)
-        await _reconcile_active_fix_job_state()
-        fix_jobs = _runtime_fix_jobs_map()
-        active_fix_jobs = _runtime_active_fix_jobs_map()
-
-        normalized_session_id = (
-            session_id.strip()
-            if session_id is not None and session_id.strip()
-            else None
-        )
-        if normalized_session_id is None:
-            normalized_session_id = runtime.store.active_session_id
-            if (
-                normalized_session_id is None
-                and runtime.store.active_session is not None
-            ):
-                normalized_session_id = runtime.store.active_session.id
-
-        if normalized_session_id:
-            active_job_id = _active_fix_job_id_for_session(normalized_session_id)
-            if active_job_id:
-                active_job = fix_jobs.get(active_job_id)
-                if active_job is not None:
-                    return {"job": active_job.model_dump(mode="json")}
-
-            session_jobs = [
-                job
-                for job in fix_jobs.values()
-                if job.session_id == normalized_session_id
-            ]
-            if not session_jobs:
-                return {"job": None}
-
-            latest_session_job = max(session_jobs, key=lambda job: job.created_at)
-            return {"job": latest_session_job.model_dump(mode="json")}
-
-        for key, active_job_id in list(active_fix_jobs.items()):
-            active_job = fix_jobs.get(active_job_id)
-            if active_job is not None:
-                return {"job": active_job.model_dump(mode="json")}
-            active_fix_jobs.pop(key, None)
-
-        if not fix_jobs:
-            return {"job": None}
-
-        latest_job = max(fix_jobs.values(), key=lambda job: job.created_at)
-        return {"job": latest_job.model_dump(mode="json")}
-
-    @app.post("/api/fix-jobs")
-    async def start_fix_job(body: StartFixJobRequest, request: Request):
-        runtime = cast(BackendRuntime, request.app.state.runtime)
-        await _reconcile_active_fix_job_state()
-
-        session_id_raw = body.session_id
-        requested_session_id = (
-            str(session_id_raw).strip() if session_id_raw is not None else None
-        )
-
-        session = _resolve_request_session(requested_session_id)
-
-        active_job_id = _active_fix_job_id_for_session(session.id)
-        if active_job_id:
-            existing = _runtime_fix_jobs_map().get(active_job_id)
-            if existing and not _is_terminal_fix_job_status(existing.status):
-                raise HTTPException(
-                    status_code=409,
-                    detail={
-                        "error": "A fix job is already running in this workspace",
-                        "job": existing.model_dump(mode="json"),
-                    },
-                )
-            _clear_active_fix_job_for_session(session.id, expected_job_id=active_job_id)
-
-        pending = pending_annotations_for_context(session)
-        if not pending:
-            raise HTTPException(
-                status_code=409,
-                detail="No pending annotations in the current branch/context",
-            )
-
-        preferred_runner, _preferred_model, _preferred_variant = _load_fix_preferences()
-        runner = _normalize_fix_runner(
-            body.runner,
-            default=preferred_runner,
-        )
-        _ensure_runner_is_available(runner)
-
-        model = body.model.strip()
-        if not model:
-            raise HTTPException(status_code=400, detail="Missing model")
-
-        variant_raw = body.variant
-        variant = str(variant_raw).strip() if variant_raw is not None else ""
-        normalized_variant = variant or None
-
-        try:
-            models = await asyncio.to_thread(_refresh_runner_models_cache, runner)
-        except RuntimeError:
-            models = []
-
-        _validate_runner_model_selection(
-            runner=runner,
-            model=model,
-            variant=normalized_variant,
-            models=models,
-        )
-
-        try:
-            await asyncio.to_thread(
-                _save_fix_preferences,
-                runner=runner,
-                model=model,
-                variant=normalized_variant,
-            )
-        except OSError:
-            # Persistence failure should not block the fix loop.
-            pass
-
-        active_branch = _active_branch(session)
-        job = FixJob(
-            runner=runner,
-            model=model,
-            variant=normalized_variant,
-            session_id=session.id,
-            workspace_dir="",
-            branch_id=active_branch.id,
-            branch_name=active_branch.name,
-            total_annotations=len(pending),
-        )
-        job.workspace_dir = str(_prepare_fix_runner_workspace(session, job_id=job.id))
-
-        _runtime_fix_jobs_map()[job.id] = job
-        _set_active_fix_job_for_session(session.id, job.id)
-
-        task = asyncio.create_task(_run_fix_job_loop(job.id, runtime=runtime))
-        _runtime_fix_job_tasks_map()[job.id] = task
-
-        await _broadcast_fix_job(job)
-        return {"status": "ok", "job": job.model_dump(mode="json")}
-
-    @app.post("/api/fix-jobs/{job_id}/cancel")
-    async def cancel_fix_job(job_id: str, request: Request):
-        _ = request
-        await _reconcile_active_fix_job_state()
-        job = _runtime_fix_jobs_map().get(job_id)
-        if job is None:
-            raise HTTPException(status_code=404, detail="Fix job not found")
-
-        if _is_terminal_fix_job_status(job.status):
-            _clear_active_fix_job_for_session(job.session_id, expected_job_id=job.id)
-            return {"status": "ok", "job": job.model_dump(mode="json")}
-
-        await _cancel_fix_job_execution(job, reason="Cancelled by user")
-        return {"status": "ok", "job": job.model_dump(mode="json")}
-
-    # ---- Plot file serving ----
-
-    @app.get("/api/plot")
-    async def get_plot(
-        request: Request,
-        session_id: str | None = None,
-        version_id: str | None = None,
-        plot_mode: bool = False,
-        workspace_id: str | None = None,
-    ):
-        """Serve a plot file for the active session, plot mode, or an explicit version."""
-        runtime = cast(BackendRuntime, request.app.state.runtime)
-
-        def _resolve_plot() -> tuple[Path, str]:
-            _ensure_session_store_loaded()
-            return _resolve_plot_response(
-                session_id=session_id,
-                version_id=version_id,
-                plot_mode=plot_mode,
-                workspace_id=workspace_id,
-            )
-
-        plot_path, _ = _with_runtime(runtime, _resolve_plot)
-
-        if not plot_path.exists():
-            raise HTTPException(status_code=404, detail="Plot file not found")
-
-        media_type = _media_type_for_plot_path(plot_path)
-        return FileResponse(str(plot_path), media_type=media_type)
-
-    @app.get("/api/plot-mode/export")
-    async def export_plot_mode_workspace(
-        request: Request,
-        workspace_id: str | None = None,
-    ):
-        runtime = cast(BackendRuntime, request.app.state.runtime)
-
-        def _resolve_export() -> tuple[Path, str, str]:
-            _ensure_session_store_loaded()
-            state = _resolve_plot_mode_workspace(workspace_id)
-
-            plot_path_raw = (state.current_plot or "").strip()
-            if not plot_path_raw:
-                raise HTTPException(
-                    status_code=409, detail="No plot preview is available yet"
-                )
-            plot_path = Path(plot_path_raw)
-            if not plot_path.exists():
-                raise HTTPException(status_code=404, detail="Plot artifact not found")
-
-            script_path = _plot_mode_generated_script_path(state)
-            if not script_path.exists():
-                script = (state.current_script or "").strip()
-                if not script:
-                    raise HTTPException(
-                        status_code=409,
-                        detail="No generated script is available yet",
-                    )
-                script_path.write_text(script, encoding="utf-8")
-
-            ext = plot_path.suffix.lower() or ".png"
-            export_stem = _safe_export_stem(
-                state.workspace_name,
-                default="plot_workspace",
-            )
-            export_dir = _plot_mode_artifacts_dir(state) / "exports"
-            export_dir.mkdir(parents=True, exist_ok=True)
-            export_zip_path = export_dir / f"{state.id}.zip"
-            return plot_path, str(script_path), str(export_zip_path), ext, export_stem
-
-        plot_path, script_path_str, export_zip_path_str, ext, export_stem = (
-            _with_runtime(
-                runtime,
-                _resolve_export,
-            )
-        )
-        script_path = Path(script_path_str)
-        export_zip_path = Path(export_zip_path_str)
-
-        with zipfile.ZipFile(
-            export_zip_path,
-            mode="w",
-            compression=zipfile.ZIP_DEFLATED,
-        ) as archive:
-            archive.write(plot_path, arcname=f"plot{ext}")
-            archive.write(script_path, arcname="script.py")
-
-        return FileResponse(
-            str(export_zip_path),
-            media_type="application/zip",
-            filename=f"openplot_{export_stem}.zip",
-        )
-
-    # ---- Branch / checkout ----
-
-    @app.post("/api/checkout")
-    async def checkout_version(body: CheckoutVersionRequest):
-        session = get_session()
-        version_id = body.version_id.strip()
-        branch_id_raw = body.branch_id
-        branch_id = str(branch_id_raw).strip() if branch_id_raw else None
-
-        if not version_id:
-            raise HTTPException(status_code=400, detail="Missing version_id")
-
-        version = _checkout_version(session, version_id, branch_id=branch_id)
-        _touch_session(session)
-        _persist_session(session, promote=True)
-
-        await _broadcast(
-            {
-                "type": "plot_updated",
-                "session_id": session.id,
-                "version_id": session.checked_out_version_id,
-                "plot_type": session.plot_type,
-                "revision": len(session.revision_history),
-                "active_branch_id": session.active_branch_id,
-                "checked_out_version_id": session.checked_out_version_id,
-                "reason": "checkout",
-            }
-        )
-
-        return {
-            "status": "ok",
-            "version_id": version.id,
-            "active_branch_id": session.active_branch_id,
-            "checked_out_version_id": session.checked_out_version_id,
-        }
-
-    @app.post("/api/branches/{branch_id}/checkout")
-    async def checkout_branch_head(branch_id: str):
-        session = get_session()
-        branch = _get_branch(session, branch_id)
-        _checkout_version(session, branch.head_version_id, branch_id=branch.id)
-        _touch_session(session)
-        _persist_session(session, promote=True)
-
-        await _broadcast(
-            {
-                "type": "plot_updated",
-                "session_id": session.id,
-                "version_id": session.checked_out_version_id,
-                "plot_type": session.plot_type,
-                "revision": len(session.revision_history),
-                "active_branch_id": session.active_branch_id,
-                "checked_out_version_id": session.checked_out_version_id,
-                "reason": "branch_switch",
-            }
-        )
-
-        return {
-            "status": "ok",
-            "branch_id": branch.id,
-            "checked_out_version_id": session.checked_out_version_id,
-        }
-
-    @app.patch("/api/branches/{branch_id}")
-    async def rename_branch(
-        branch_id: str,
-        body: RenameBranchRequest,
-        request: Request,
-    ):
-        runtime = cast(BackendRuntime, request.app.state.runtime)
-
-        def _rename_branch_request() -> dict[str, object]:
-            session = get_session()
-            branch = _get_branch(session, branch_id)
-
-            raw_name = body.name if body.name is not None else body.branch_name
-            next_name = normalize_branch_name(raw_name)
-            ensure_unique_branch_name(
-                session.branches,
-                current_branch_id=branch.id,
-                candidate=next_name,
-            )
-
-            branch.name = next_name
-            sync_fix_job_branch_names(
-                _runtime_fix_jobs_map().values(),
-                session_id=session.id,
-                branch_id=branch.id,
-                branch_name=next_name,
-            )
-
-            _touch_session(session)
-            _persist_session(session, promote=True)
-
-            return {
-                "status": "ok",
-                "branch": branch.model_dump(),
-                "active_branch_id": session.active_branch_id,
-            }
-
-        return _with_runtime(runtime, _rename_branch_request)
-
-    # ---- Annotations ----
-
-    @app.post("/api/annotations")
-    async def add_annotation(annotation: Annotation):
-        session = get_session()
-
-        active_branch = _active_branch(session)
-        base_version_id = (
-            session.checked_out_version_id or active_branch.head_version_id
-        )
-
-        if base_version_id and base_version_id != active_branch.head_version_id:
-            active_branch = _create_branch(session, base_version_id=base_version_id)
-            session.active_branch_id = active_branch.id
-
-        annotation.plot_id = session.id
-        annotation.base_version_id = base_version_id
-        annotation.branch_id = active_branch.id
-        session.annotations.append(annotation)
-        _touch_session(session)
-        _persist_session(session, promote=True)
-
-        await _broadcast(
-            {
-                "type": "annotation_added",
-                "session_id": session.id,
-                "annotation": annotation.model_dump(),
-                "active_branch_id": session.active_branch_id,
-                "checked_out_version_id": session.checked_out_version_id,
-            }
-        )
-        return {"status": "ok", "id": annotation.id}
-
-    @app.get("/api/annotations/{annotation_id}/export")
-    async def export_annotation_plot(annotation_id: str):
-        session = get_session()
-        ann = next((a for a in session.annotations if a.id == annotation_id), None)
-        if ann is None:
-            raise HTTPException(status_code=404, detail="Annotation not found")
-
-        if ann.status != AnnotationStatus.addressed or not ann.addressed_in_version_id:
-            raise HTTPException(
-                status_code=409,
-                detail="Only addressed annotations can be exported",
-            )
-
-        version = _get_version(session, ann.addressed_in_version_id)
-        plot_path = Path(version.plot_artifact_path)
-        if not plot_path.exists():
-            raise HTTPException(status_code=404, detail="Plot artifact not found")
-
-        if not version.script_artifact_path:
-            raise HTTPException(status_code=404, detail="Script artifact not found")
-        script_path = Path(version.script_artifact_path)
-        if not script_path.exists():
-            raise HTTPException(status_code=404, detail="Script artifact not found")
-
-        ext = plot_path.suffix.lower() or ".png"
-        branch_part = ann.branch_id or "branch"
-        filename = f"openplot_{branch_part}_annotation_{ann.id}.zip"
-
-        export_dir = _session_artifacts_root(session) / "exports"
-        export_dir.mkdir(parents=True, exist_ok=True)
-        export_zip_path = export_dir / f"{ann.id}_{version.id}.zip"
-
-        with zipfile.ZipFile(
-            export_zip_path,
-            mode="w",
-            compression=zipfile.ZIP_DEFLATED,
-        ) as archive:
-            archive.write(plot_path, arcname=f"plot{ext}")
-            archive.write(script_path, arcname="script.py")
-
-        return FileResponse(
-            str(export_zip_path),
-            media_type="application/zip",
-            filename=filename,
-        )
-
-    @app.delete("/api/annotations/{annotation_id}")
-    async def delete_annotation(annotation_id: str):
-        session = get_session()
-        ann = next((a for a in session.annotations if a.id == annotation_id), None)
-        if ann is None:
-            raise HTTPException(status_code=404, detail="Annotation not found")
-
-        deleted_ids = {annotation_id}
-
-        if ann.status == AnnotationStatus.addressed:
-            if not ann.addressed_in_version_id:
-                raise HTTPException(
-                    status_code=409,
-                    detail="Addressed annotation has no version reference",
-                )
-
-            active_branch = _active_branch(session)
-            tip_version_id = active_branch.head_version_id
-            if ann.addressed_in_version_id != tip_version_id:
-                raise HTTPException(
-                    status_code=409,
-                    detail=(
-                        "Tip-only undo: only the active branch head annotation "
-                        "can be deleted"
-                    ),
-                )
-
-            tip_version = _get_version(session, tip_version_id)
-            parent_id = tip_version.parent_version_id
-            if not parent_id:
-                raise HTTPException(
-                    status_code=409,
-                    detail="Cannot undo the root version",
-                )
-
-            active_branch.head_version_id = parent_id
-            session.versions = [v for v in session.versions if v.id != tip_version_id]
-            _delete_version_artifacts(session, tip_version_id)
-
-            stale_pending_ids = {
-                a.id
-                for a in session.annotations
-                if a.status == AnnotationStatus.pending
-                and a.base_version_id == tip_version_id
-            }
-            deleted_ids.update(stale_pending_ids)
-            session.annotations = [
-                a for a in session.annotations if a.id not in deleted_ids
-            ]
-
-            _checkout_version(session, parent_id, branch_id=active_branch.id)
-
-            await _broadcast(
-                {
-                    "type": "plot_updated",
-                    "session_id": session.id,
-                    "version_id": session.checked_out_version_id,
-                    "plot_type": session.plot_type,
-                    "revision": len(session.revision_history),
-                    "active_branch_id": session.active_branch_id,
-                    "checked_out_version_id": session.checked_out_version_id,
-                    "reason": "undo_tip",
-                }
-            )
-        else:
-            session.annotations = [
-                a for a in session.annotations if a.id != annotation_id
-            ]
-
-        _touch_session(session)
-        _persist_session(session, promote=True)
-
-        await _broadcast(
-            {
-                "type": "annotation_deleted",
-                "session_id": session.id,
-                "id": annotation_id,
-                "deleted_ids": sorted(deleted_ids),
-            }
-        )
-
-        return {"status": "ok", "deleted_ids": sorted(deleted_ids)}
-
-    @app.patch("/api/annotations/{annotation_id}")
-    async def update_annotation(annotation_id: str, updates: AnnotationUpdateRequest):
-        session = get_session()
-        for ann in session.annotations:
-            if ann.id == annotation_id:
-                if updates.feedback is not None:
-                    ann.feedback = updates.feedback
-                if "status" in updates.model_fields_set:
-                    raise HTTPException(
-                        status_code=400,
-                        detail=(
-                            "Annotation status is system-managed. "
-                            "Use script submission to address feedback and tip undo to rewind."
-                        ),
-                    )
-                _touch_session(session)
-                _persist_session(session, promote=True)
-                await _broadcast(
-                    {
-                        "type": "annotation_updated",
-                        "session_id": session.id,
-                        "annotation": ann.model_dump(),
-                    }
-                )
-                return {"status": "ok"}
-        raise HTTPException(status_code=404, detail="Annotation not found")
-
-    # ---- Feedback compilation ----
-
-    @app.get("/api/feedback")
-    async def get_feedback(session_id: str | None = None):
-        """Return compiled feedback prompt for active-branch pending feedback (FIFO)."""
-        session = _resolve_request_session(session_id)
-        scoped_annotations = pending_annotations_for_context(session)
-
-        scoped_session = session.model_copy(deep=True)
-        scoped_session.annotations = scoped_annotations
-        prompt = compile_feedback(scoped_session)
-
-        return {
-            "prompt": prompt,
-            "annotation_count": len(scoped_annotations),
-            "active_branch_id": session.active_branch_id,
-            "checked_out_version_id": session.checked_out_version_id,
-            "target_annotation_id": scoped_annotations[0].id
-            if scoped_annotations
-            else None,
-        }
-
-    # ---- Script submission (from MCP / agent) ----
-
-    @app.post("/api/script")
-    async def submit_script(body: SubmitScriptRequest, session_id: str | None = None):
-        """Receive updated script, re-execute, create one new version node."""
-        session = _resolve_request_session(session_id)
-
-        code = body.code
-        if not code.strip():
-            raise HTTPException(status_code=400, detail="Empty script")
-
-        target_annotation_id = body.annotation_id
-        target_annotation = _resolve_target_annotation(session, target_annotation_id)
-
-        if not target_annotation.base_version_id:
-            target_annotation.base_version_id = (
-                session.checked_out_version_id
-                or _active_branch(session).head_version_id
-            )
-        if not target_annotation.branch_id:
-            target_annotation.branch_id = session.active_branch_id
-
-        target_branch = _get_branch(session, target_annotation.branch_id)
-        # Branching is decided when annotation is created. During submit, always
-        # append on that branch's current head so queued feedback stays linear.
-        parent_version_id = target_branch.head_version_id
-        target_annotation.base_version_id = parent_version_id
-
-        source_script_path = (
-            _resolve_session_file_path(session, session.source_script_path)
-            if session.source_script_path
-            else None
-        )
-
-        base_dir = (
-            source_script_path.parent
-            if source_script_path is not None and source_script_path.parent.exists()
-            else _workspace_for_session(session)
-        )
-
-        with tempfile.NamedTemporaryFile(
-            mode="w",
-            encoding="utf-8",
-            suffix=".py",
-            prefix="openplot_candidate_",
-            dir=base_dir,
-            delete=False,
-        ) as tmp:
-            tmp.write(code)
-            candidate_path = Path(tmp.name)
-
-        result = execute_script(
-            candidate_path,
-            work_dir=base_dir,
-            capture_dir=_new_run_output_dir(session),
-            python_executable=_resolve_python_executable(session),
-        )
-
-        if not result.success:
-            raise HTTPException(
-                status_code=422,
-                detail={
-                    "error": result.error,
-                    "stderr": result.stderr,
-                    "stdout": result.stdout,
-                    "candidate_script_path": str(candidate_path),
-                },
-            )
-
-        candidate_path.unlink(missing_ok=True)
-
-        session.source_script = code
-        if not session.source_script_path:
-            generated_path = (
-                _session_artifacts_root(session) / "working" / "openplot_generated.py"
-            )
-            generated_path.parent.mkdir(parents=True, exist_ok=True)
-            session.source_script_path = str(generated_path)
-
-        if not result.plot_path:
-            raise HTTPException(
-                status_code=500,
-                detail="Script succeeded but no plot artifact was produced.",
-            )
-
-        session.plot_type = result.plot_type or "svg"
-
-        version_id = _new_id()
-        script_artifact_path, plot_artifact_path = _write_version_artifacts(
-            session,
-            version_id,
-            script=code,
-            plot_path=result.plot_path,
-        )
-        version_node = VersionNode(
-            id=version_id,
-            parent_version_id=parent_version_id,
-            branch_id=target_branch.id,
-            annotation_id=target_annotation.id,
-            script_artifact_path=script_artifact_path,
-            plot_artifact_path=plot_artifact_path,
-            plot_type=session.plot_type,
-        )
-        session.versions.append(version_node)
-
-        target_branch.head_version_id = version_id
-        session.active_branch_id = target_branch.id
-
-        target_annotation.status = AnnotationStatus.addressed
-        target_annotation.addressed_in_version_id = version_id
-
-        _checkout_version(session, version_id, branch_id=target_branch.id)
-        _touch_session(session)
-        _persist_session(session, promote=True)
-
-        await _broadcast(
-            {
-                "type": "plot_updated",
-                "session_id": session.id,
-                "version_id": session.checked_out_version_id,
-                "plot_type": session.plot_type,
-                "revision": len(session.revision_history),
-                "active_branch_id": session.active_branch_id,
-                "checked_out_version_id": session.checked_out_version_id,
-                "reason": "new_version",
-                "annotation_id": target_annotation.id,
-            }
-        )
-
-        return {
-            "status": "ok",
-            "plot_type": session.plot_type,
-            "revision": len(session.revision_history),
-            "version_id": version_id,
-            "active_branch_id": session.active_branch_id,
-            "checked_out_version_id": session.checked_out_version_id,
-            "addressed_annotation_id": target_annotation.id,
-        }
-
-    # ---- Revision history ----
-
-    @app.get("/api/revisions")
-    async def get_revisions():
-        session = get_session()
-        _rebuild_revision_history(session)
-        return [r.model_dump() for r in session.revision_history]
-
-    # ---- WebSocket ----
-
-    @app.websocket("/ws")
-    async def websocket_endpoint(ws: WebSocket):
-        runtime = cast(BackendRuntime, ws.app.state.runtime)
-        await ws.accept()
-        runtime.infra.ws_clients.add(ws)
-        with _runtime_context(runtime):
-            try:
-                while True:
-                    _ = await ws.receive_text()
-            except WebSocketDisconnect:
-                pass
-            finally:
-                runtime.infra.ws_clients.discard(ws)
+    app.include_router(sessions_router)
+    app.include_router(plot_mode_router)
+    app.include_router(annotations_router)
+    app.include_router(fix_jobs_router)
+    app.include_router(runners_router)
+    app.include_router(preferences_router)
+    app.include_router(artifacts_router)
+    app.include_router(versioning_router)
+    app.include_router(runtime_router)
+    app.include_router(ws_router)

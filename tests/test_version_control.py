@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import io
+import importlib
 import zipfile
 from pathlib import Path
 
@@ -269,6 +270,62 @@ def test_branch_rename_updates_injected_runtime_fix_jobs_only(tmp_path: Path) ->
         assert runtime.store.fix_jobs[job.id].branch_name == "runtime-branch"
 
     assert shared_runtime.store.fix_jobs == {}
+
+
+def test_versioning_router_delegates_submit_script_to_service(
+    monkeypatch, tmp_path: Path
+) -> None:
+    monkeypatch.setenv("XDG_STATE_HOME", str(tmp_path / "state"))
+    versioning_service = importlib.import_module("openplot.services.versioning")
+
+    called: dict[str, object] = {}
+
+    async def fake_submit_script(body, *, session_id=None):
+        called["code"] = body.code
+        called["session_id"] = session_id
+        return {"status": "ok", "version_id": "version-delegated"}
+
+    monkeypatch.setattr(versioning_service, "submit_script", fake_submit_script)
+
+    with TestClient(create_app()) as client:
+        response = client.post(
+            "/api/script",
+            json={"code": "print('delegated')", "annotation_id": "annotation-1"},
+            params={"session_id": "session-1"},
+        )
+
+    assert response.status_code == 200
+    assert response.json()["version_id"] == "version-delegated"
+    assert called["code"] == "print('delegated')"
+    assert called["session_id"] == "session-1"
+
+
+def test_annotations_router_delegates_update_to_service(
+    monkeypatch, tmp_path: Path
+) -> None:
+    monkeypatch.setenv("XDG_STATE_HOME", str(tmp_path / "state"))
+    annotations_service = importlib.import_module("openplot.services.annotations")
+
+    called: dict[str, object] = {}
+
+    async def fake_update_annotation(annotation_id, updates):
+        called["annotation_id"] = annotation_id
+        called["feedback"] = updates.feedback
+        return {"status": "ok"}
+
+    monkeypatch.setattr(
+        annotations_service, "update_annotation", fake_update_annotation
+    )
+
+    with TestClient(create_app()) as client:
+        response = client.patch(
+            "/api/annotations/annotation-1",
+            json={"feedback": "delegated"},
+        )
+
+    assert response.status_code == 200
+    assert called["annotation_id"] == "annotation-1"
+    assert called["feedback"] == "delegated"
 
 
 def test_script_revision_checkout_and_branch_endpoints_round_trip(

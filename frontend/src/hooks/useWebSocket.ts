@@ -1,6 +1,26 @@
 import { useEffect, useRef, useCallback, useMemo, useState } from "react";
 import type { WsEvent } from "../types";
 
+export function subscribeToRawWsEvents(
+  socket: Pick<WebSocket, "addEventListener" | "removeEventListener">,
+  onEvent: (event: WsEvent) => void,
+) {
+  const handleMessage = (ev: MessageEvent<string>) => {
+    try {
+      const event: WsEvent = JSON.parse(ev.data);
+      onEvent(event);
+    } catch {
+      // Ignore non-JSON messages.
+    }
+  };
+
+  socket.addEventListener("message", handleMessage);
+
+  return () => {
+    socket.removeEventListener("message", handleMessage);
+  };
+}
+
 /**
  * Connect to the OpenPlot WebSocket and dispatch incoming events.
  */
@@ -87,16 +107,12 @@ export function useWebSocket(onEvent: (event: WsEvent) => void) {
         }, 15000);
       });
 
-      socket.addEventListener("message", (ev) => {
-        try {
-          const event: WsEvent = JSON.parse(ev.data);
-          onEventRef.current(event);
-        } catch {
-          // Ignore non-JSON messages.
-        }
+      const unsubscribeFromMessages = subscribeToRawWsEvents(socket, (event) => {
+        onEventRef.current(event);
       });
 
       socket.addEventListener("close", () => {
+        unsubscribeFromMessages();
         clearHeartbeatTimer();
         scheduleReconnect();
       });

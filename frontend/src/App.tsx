@@ -1,32 +1,14 @@
 import "./App.css";
 import { useCallback, useEffect, useMemo, useRef, useState } from "react";
-import { CircleHelp } from "lucide-react";
 import { useWebSocket } from "./hooks/useWebSocket";
 import { useSessionState } from "./hooks/useSessionState";
 import { useWorkspaceActions } from "./hooks/useWorkspaceActions";
-import PlotViewer from "./components/PlotViewer";
-import PlotModePreview from "./components/PlotModePreview";
-import PlotModeSidebar from "./components/PlotModeSidebar";
-import SessionSidebar from "./components/SessionSidebar";
-import Toolbar from "./components/Toolbar";
-import FeedbackSidebar from "./components/FeedbackSidebar";
-import FixStepLiveModal from "./components/FixStepLiveModal";
 import RunnerAuthDialog from "./components/RunnerAuthDialog";
 import RunnerManager from "./components/RunnerManager";
-import NotificationBubbleStack, {
-  type NotificationBubble,
-} from "./components/NotificationBubbleStack";
-import WalkthroughPromptModal from "./components/WalkthroughPromptModal";
-import WalkthroughTour from "./components/WalkthroughTour";
-import PlotModeWalkthroughTour from "./components/PlotModeWalkthroughTour";
-import { Button } from "@/components/ui/button";
+import type { NotificationBubble } from "./components/NotificationBubbleStack";
+import AnnotationWorkspaceScreen from "./components/app/AnnotationWorkspaceScreen";
+import PlotModeScreen from "./components/app/PlotModeScreen";
 import { Card, CardContent, CardDescription, CardTitle } from "@/components/ui/card";
-import {
-  ResizableHandle,
-  ResizablePanel,
-  ResizablePanelGroup,
-} from "@/components/ui/resizable";
-import { TooltipProvider } from "@/components/ui/tooltip";
 import { asErrorMessage } from "@/lib/errors";
 import {
   createInitialWalkthroughPromptState,
@@ -1305,202 +1287,108 @@ function App() {
     const selectedFileCount = plotMode?.files.length ?? 0;
 
     return (
-      <div className="flex h-dvh flex-col overflow-hidden bg-background text-foreground">
-        <NotificationBubbleStack
-          notifications={notifications}
-          onDismiss={dismissNotification}
-        />
-        <Toolbar
-          mode="plot"
-          connected={connected}
-          wsUrl={wsUrl}
-          reconnectAttempts={reconnectAttempts}
-          lastConnectedAt={lastConnectedAt}
-          lastDisconnectedAt={lastDisconnectedAt}
-          opencodeModels={opencodeModels}
-          opencodeModelsLoading={opencodeModelsLoading}
-          opencodeModelsError={opencodeModelsError}
-          availableRunners={availableRunners}
-          selectedRunner={selectedRunner}
-          onChangeRunner={handleToolbarRunnerChange}
-          selectedModel={effectiveSelectedModel}
-          selectedVariant={effectiveSelectedVariant}
-          onChangeModel={handleToolbarModelChange}
-          onChangeVariant={handleToolbarVariantChange}
-          pythonInterpreterState={pythonInterpreter}
-          pythonInterpreterLoading={pythonInterpreterLoading}
-          pythonInterpreterError={pythonInterpreterError}
-          onRefreshPythonInterpreter={refreshPythonInterpreter}
-          onSavePythonInterpreter={handleSavePythonInterpreter}
-          runnerStatus={runnerStatus}
-          runnerStatusLoading={runnerStatusLoading}
-          runnerStatusError={runnerManagerError ?? runnerStatusError}
-          onInstallRunner={handleInstallRunner}
-          onAuthenticateRunner={handleAuthenticateRunner}
-          onOpenRunnerGuide={handleOpenRunnerGuide}
-          onRefreshRunners={handleRefreshRunners}
-          updateStatus={updateStatus}
-          updateStatusLoading={updateStatusLoading}
-          onRefreshUpdateStatus={refreshUpdateStatus}
-          onOpenReleasePage={handleOpenLatestRelease}
-        />
-
-        {allowWorkspaceSidebar ? (
-          <div
-            aria-hidden
-            className="fixed inset-y-0 left-0 z-30 hidden w-8 lg:block"
-            onMouseEnter={handleWorkspaceHotzoneEnter}
-            onMouseLeave={handleWorkspaceHotzoneLeave}
-          />
-        ) : null}
-
-        <div className="flex min-h-0 flex-1 overflow-hidden">
-          <SessionSidebar
-            open={showWorkspaceSidebar}
-            sessions={sessions}
-            activeWorkspaceId={activeWorkspaceId}
-            plotWorkspaceBusyById={plotWorkspaceBusyById}
-            actionPending={sessionActionPending}
-            onSelectSession={(sessionId) => {
-              void handleSidebarSelectSession(sessionId);
-            }}
-            onNewSession={() => {
-              void handleSidebarCreateSession();
-            }}
-            onRenameWorkspace={(sessionId, workspaceName) => {
-              void handleRenameWorkspace(sessionId, workspaceName);
-            }}
-            onDeleteWorkspace={(sessionId) => {
-              void handleDeleteWorkspace(sessionId);
-            }}
-            pinned={workspacePanelPinned}
-            onTogglePinned={handleToggleWorkspacePanelPinned}
-            onPanelMouseEnter={handleWorkspacePanelMouseEnter}
-            onPanelMouseLeave={handleWorkspacePanelMouseLeave}
-            onClose={handleWorkspacePanelClose}
-          />
-
-          {desktopViewport ? (
-            <div className="min-h-0 flex-1 overflow-hidden">
-              <ResizablePanelGroup orientation="horizontal" className="h-full w-full">
-                <ResizablePanel defaultSize="67%" minSize="44%">
-                  <main className="h-full min-h-0 min-w-0 overflow-hidden">
-                    <PlotModePreview
-                      hasPlot={Boolean(plotMode?.current_plot)}
-                      imageUrl={plotModePreviewUrl}
-                      workspaceId={plotMode?.id ?? "plot-mode"}
-                      plotVersion={plotVersion}
-                      downloadingExport={downloadingPlotExport}
-                      onDownload={handleDownloadPlotModeExport}
-                      onGraphHoverChange={setIsPlotRegionHovered}
-                    />
-                  </main>
-                </ResizablePanel>
-
-                <ResizableHandle
-                  withHandle
-                  className="bg-transparent text-muted-foreground/70 transition-colors hover:text-foreground"
-                />
-
-                <ResizablePanel defaultSize="33%" minSize="33%">
-                  <div className="h-full min-h-0 overflow-hidden">
-                    <PlotModeSidebar
-                      state={plotMode}
-                      desktopViewport={desktopViewport}
-                      forceInitialFileSelection={forcePlotFileSelection}
-                      selectingFiles={activePlotWorkspaceActions.selectingFiles}
-                      sendingMessage={activePlotWorkspaceActions.sendingMessage}
-                      finalizing={activePlotWorkspaceActions.finalizing}
-                      onFetchPathSuggestions={handleFetchPlotModePathSuggestions}
-                      onSelectPaths={handleSelectPlotModePaths}
-                      onSubmitTabularHint={handleSubmitTabularHint}
-                      onSendMessage={handleSendPlotMessage}
-                      onShowError={enqueueErrorNotification}
-                      walkthroughFocusedTarget={walkthroughFocusedTarget}
-                      plotModeExecutionMode={plotMode?.execution_mode ?? "quick"}
-                      onChangePlotModeExecutionMode={handleSetPlotExecutionMode}
-                      onAnswerQuestion={handleAnswerPlotQuestion}
-                      onNext={handleFinalizePlotMode}
-                    />
-                  </div>
-                </ResizablePanel>
-              </ResizablePanelGroup>
-            </div>
-          ) : (
-            <div className="flex min-h-0 flex-1 flex-col overflow-hidden">
-              <main className="min-h-0 min-w-0 flex-1 overflow-hidden">
-                <PlotModePreview
-                  hasPlot={Boolean(plotMode?.current_plot)}
-                  imageUrl={plotModePreviewUrl}
-                  workspaceId={plotMode?.id ?? "plot-mode"}
-                  plotVersion={plotVersion}
-                  downloadingExport={downloadingPlotExport}
-                  onDownload={handleDownloadPlotModeExport}
-                  onGraphHoverChange={setIsPlotRegionHovered}
-                />
-              </main>
-
-              <PlotModeSidebar
-                state={plotMode}
-                desktopViewport={desktopViewport}
-                forceInitialFileSelection={forcePlotFileSelection}
-                selectingFiles={activePlotWorkspaceActions.selectingFiles}
-                sendingMessage={activePlotWorkspaceActions.sendingMessage}
-                finalizing={activePlotWorkspaceActions.finalizing}
-                onFetchPathSuggestions={handleFetchPlotModePathSuggestions}
-                onSelectPaths={handleSelectPlotModePaths}
-                onSubmitTabularHint={handleSubmitTabularHint}
-                onSendMessage={handleSendPlotMessage}
-                onShowError={enqueueErrorNotification}
-                walkthroughFocusedTarget={walkthroughFocusedTarget}
-                plotModeExecutionMode={plotMode?.execution_mode ?? "quick"}
-                onChangePlotModeExecutionMode={handleSetPlotExecutionMode}
-                onAnswerQuestion={handleAnswerPlotQuestion}
-                onNext={handleFinalizePlotMode}
-              />
-            </div>
-          )}
-        </div>
-
-        <footer
-          data-walkthrough="plot-mode-footer"
-          className="flex items-center justify-between border-t border-border/80 bg-muted/35 px-4 py-1.5 text-xs text-muted-foreground"
-        >
-          <span>
-            {selectedFileCount} selected file{selectedFileCount === 1 ? "" : "s"}
-          </span>
-          <div className="flex shrink-0 items-center gap-1.5">
-            <span>Refine the draft here, then move to annotation when it is ready</span>
-            <Button
-              type="button"
-              variant="ghost"
-              size="icon-xs"
-              onClick={handleStartWalkthrough}
-              aria-label="Restart walkthrough"
-              title="Restart walkthrough"
-            >
-              <CircleHelp className="h-3.5 w-3.5" />
-            </Button>
-          </div>
-        </footer>
-
-        <WalkthroughPromptModal
-          open={walkthroughPromptState.plot}
-          mode="plot"
-          onStart={handleStartWalkthrough}
-          onDismiss={handleDismissWalkthroughPrompt}
-          onDontShowAgain={handleDontShowWalkthroughAgain}
-        />
-
-        {showPlotModeWalkthroughTour ? (
-          <PlotModeWalkthroughTour
-            onClose={handleClosePlotModeWalkthroughTour}
-            onStepTargetChange={setWalkthroughFocusedTarget}
-          />
-        ) : null}
-
-        {runnerAuthDialog}
-      </div>
+      <PlotModeScreen
+        notifications={notifications}
+        onDismissNotification={dismissNotification}
+        toolbarProps={{
+          mode: "plot",
+          connected,
+          wsUrl,
+          reconnectAttempts,
+          lastConnectedAt,
+          lastDisconnectedAt,
+          opencodeModels,
+          opencodeModelsLoading,
+          opencodeModelsError,
+          availableRunners,
+          selectedRunner,
+          onChangeRunner: handleToolbarRunnerChange,
+          selectedModel: effectiveSelectedModel,
+          selectedVariant: effectiveSelectedVariant,
+          onChangeModel: handleToolbarModelChange,
+          onChangeVariant: handleToolbarVariantChange,
+          pythonInterpreterState: pythonInterpreter,
+          pythonInterpreterLoading,
+          pythonInterpreterError,
+          onRefreshPythonInterpreter: refreshPythonInterpreter,
+          onSavePythonInterpreter: handleSavePythonInterpreter,
+          runnerStatus,
+          runnerStatusLoading,
+          runnerStatusError: runnerManagerError ?? runnerStatusError,
+          onInstallRunner: handleInstallRunner,
+          onAuthenticateRunner: handleAuthenticateRunner,
+          onOpenRunnerGuide: handleOpenRunnerGuide,
+          onRefreshRunners: handleRefreshRunners,
+          updateStatus,
+          updateStatusLoading,
+          onRefreshUpdateStatus: refreshUpdateStatus,
+          onOpenReleasePage: handleOpenLatestRelease,
+        }}
+        allowWorkspaceSidebar={allowWorkspaceSidebar}
+        showWorkspaceSidebar={showWorkspaceSidebar}
+        onWorkspaceHotzoneEnter={handleWorkspaceHotzoneEnter}
+        onWorkspaceHotzoneLeave={handleWorkspaceHotzoneLeave}
+        sessionSidebarProps={{
+          sessions,
+          activeWorkspaceId,
+          plotWorkspaceBusyById,
+          actionPending: sessionActionPending,
+          onSelectSession: (sessionId) => {
+            void handleSidebarSelectSession(sessionId);
+          },
+          onNewSession: () => {
+            void handleSidebarCreateSession();
+          },
+          onRenameWorkspace: (sessionId, workspaceName) => {
+            void handleRenameWorkspace(sessionId, workspaceName);
+          },
+          onDeleteWorkspace: (sessionId) => {
+            void handleDeleteWorkspace(sessionId);
+          },
+          pinned: workspacePanelPinned,
+          onTogglePinned: handleToggleWorkspacePanelPinned,
+          onPanelMouseEnter: handleWorkspacePanelMouseEnter,
+          onPanelMouseLeave: handleWorkspacePanelMouseLeave,
+          onClose: handleWorkspacePanelClose,
+        }}
+        desktopViewport={desktopViewport}
+        plotModePreviewProps={{
+          hasPlot: Boolean(plotMode?.current_plot),
+          imageUrl: plotModePreviewUrl,
+          workspaceId: plotMode?.id ?? "plot-mode",
+          plotVersion,
+          downloadingExport: downloadingPlotExport,
+          onDownload: handleDownloadPlotModeExport,
+          onGraphHoverChange: setIsPlotRegionHovered,
+        }}
+        plotModeSidebarProps={{
+          state: plotMode,
+          forceInitialFileSelection: forcePlotFileSelection,
+          selectingFiles: activePlotWorkspaceActions.selectingFiles,
+          sendingMessage: activePlotWorkspaceActions.sendingMessage,
+          finalizing: activePlotWorkspaceActions.finalizing,
+          onFetchPathSuggestions: handleFetchPlotModePathSuggestions,
+          onSelectPaths: handleSelectPlotModePaths,
+          onSubmitTabularHint: handleSubmitTabularHint,
+          onSendMessage: handleSendPlotMessage,
+          onShowError: enqueueErrorNotification,
+          walkthroughFocusedTarget,
+          plotModeExecutionMode: plotMode?.execution_mode ?? "quick",
+          onChangePlotModeExecutionMode: handleSetPlotExecutionMode,
+          onAnswerQuestion: handleAnswerPlotQuestion,
+          onNext: handleFinalizePlotMode,
+        }}
+        selectedFileCount={selectedFileCount}
+        onRestartWalkthrough={handleStartWalkthrough}
+        walkthroughPromptOpen={walkthroughPromptState.plot}
+        onStartWalkthrough={handleStartWalkthrough}
+        onDismissWalkthroughPrompt={handleDismissWalkthroughPrompt}
+        onDontShowWalkthroughAgain={handleDontShowWalkthroughAgain}
+        showPlotModeWalkthroughTour={showPlotModeWalkthroughTour}
+        onClosePlotModeWalkthroughTour={handleClosePlotModeWalkthroughTour}
+        onPlotModeWalkthroughStepTargetChange={setWalkthroughFocusedTarget}
+        runnerAuthDialog={runnerAuthDialog}
+      />
     );
   }
 
@@ -1525,178 +1413,136 @@ function App() {
   }
 
   return (
-    <TooltipProvider>
-      <div className="flex h-dvh flex-col overflow-hidden bg-background text-foreground">
-        <NotificationBubbleStack
-          notifications={notifications}
-          onDismiss={dismissNotification}
-        />
-        <Toolbar
-          mode="annotation"
-          connected={connected}
-          branches={session.branches}
-          activeBranchId={session.active_branch_id}
-          checkedOutVersionId={session.checked_out_version_id}
-          wsUrl={wsUrl}
-          reconnectAttempts={reconnectAttempts}
-          lastConnectedAt={lastConnectedAt}
-          lastDisconnectedAt={lastDisconnectedAt}
-          opencodeModels={opencodeModels}
-          opencodeModelsLoading={opencodeModelsLoading}
-          opencodeModelsError={opencodeModelsError}
-          availableRunners={availableRunners}
-          selectedRunner={selectedRunner}
-          onChangeRunner={handleToolbarRunnerChange}
-          selectedModel={effectiveSelectedModel}
-          selectedVariant={effectiveSelectedVariant}
-          onChangeModel={handleToolbarModelChange}
-          onChangeVariant={handleToolbarVariantChange}
-          pythonInterpreterState={pythonInterpreter}
-          pythonInterpreterLoading={pythonInterpreterLoading}
-          pythonInterpreterError={pythonInterpreterError}
-          onRefreshPythonInterpreter={refreshPythonInterpreter}
-          onSavePythonInterpreter={handleSavePythonInterpreter}
-          runnerStatus={runnerStatus}
-          runnerStatusLoading={runnerStatusLoading}
-          runnerStatusError={runnerManagerError ?? runnerStatusError}
-          onInstallRunner={handleInstallRunner}
-          onAuthenticateRunner={handleAuthenticateRunner}
-          onOpenRunnerGuide={handleOpenRunnerGuide}
-          onRefreshRunners={handleRefreshRunners}
-          updateStatus={updateStatus}
-          updateStatusLoading={updateStatusLoading}
-          onRefreshUpdateStatus={refreshUpdateStatus}
-          onOpenReleasePage={handleOpenLatestRelease}
-        />
-
-        <div
-          aria-hidden
-          className="fixed inset-y-0 left-0 z-30 hidden w-8 lg:block"
-          onMouseEnter={handleWorkspaceHotzoneEnter}
-          onMouseLeave={handleWorkspaceHotzoneLeave}
-        />
-
-        <div className="flex min-h-0 flex-1 overflow-hidden">
-          <SessionSidebar
-            open={showWorkspaceSidebar}
-            sessions={sessions}
-            activeWorkspaceId={activeWorkspaceId}
-            plotWorkspaceBusyById={plotWorkspaceBusyById}
-            actionPending={sessionActionPending}
-            onSelectSession={(sessionId) => {
-              void handleSidebarSelectSession(sessionId);
-            }}
-            onNewSession={() => {
-              void handleSidebarCreateSession();
-            }}
-            onRenameWorkspace={(sessionId, workspaceName) => {
-              void handleRenameWorkspace(sessionId, workspaceName);
-            }}
-            onDeleteWorkspace={(sessionId) => {
-              void handleDeleteWorkspace(sessionId);
-            }}
-            pinned={workspacePanelPinned}
-            onTogglePinned={handleToggleWorkspacePanelPinned}
-            onPanelMouseEnter={handleWorkspacePanelMouseEnter}
-            onPanelMouseLeave={handleWorkspacePanelMouseLeave}
-            onClose={handleWorkspacePanelClose}
-          />
-
-          <div className="flex min-h-0 flex-1 flex-col overflow-hidden lg:flex-row">
-            <main className="min-h-0 min-w-0 flex-1 overflow-hidden">
-              <PlotViewer
-                key={`${session.id}:${session.checked_out_version_id || "none"}:${plotVersion}`}
-                imageUrl={activePlotUrl}
-                workspaceId={session.id}
-                annotations={activeBranchAnnotations}
-                focusedAnnotationId={focusedAnnotationIdForBranch}
-                onAddAnnotation={addAnnotation}
-                fixStatusBubble={fixStatusBubble}
-                onSelectionActivityChange={setAnnotationSelectionActive}
-                onGraphHoverChange={setIsPlotRegionHovered}
-              />
-            </main>
-
-            <FeedbackSidebar
-              annotations={session.annotations}
-              versions={session.versions}
-              branches={session.branches}
-              rootVersionId={session.root_version_id}
-              activeBranchId={session.active_branch_id}
-              checkedOutVersionId={session.checked_out_version_id}
-              onSwitchBranch={async (branchId) => {
-                await switchBranch(branchId);
-                setFocusedAnnotationId(null);
-              }}
-              onRenameBranch={renameBranch}
-              focusedAnnotationId={focusedAnnotationIdForBranch}
-              onSelectInitialState={handleSelectInitialState}
-              onSelectAnnotation={handleSelectAnnotation}
-              onDownload={handleDownloadAnnotation}
-              onDelete={deleteAnnotation}
-              onUpdate={updateAnnotation}
-              selectedRunner={selectedRunner}
-              selectedModel={effectiveSelectedModel}
-              selectedVariant={effectiveSelectedVariant}
-              opencodeModelsLoading={opencodeModelsLoading}
-              opencodeModelsError={opencodeModelsError}
-              fixJob={fixJob}
-              onStartFixJob={startFixJob}
-              onCancelFixJob={cancelFixJob}
-            />
-          </div>
-        </div>
-
-        <footer
-          data-walkthrough="session-footer"
-          className="flex items-center justify-between border-t border-border/80 bg-muted/35 px-4 py-1.5 text-xs text-muted-foreground"
-        >
-          <span className="truncate pr-4">
-            {session.source_script_path ?? "Static file"} &mdash; {session.plot_type.toUpperCase()} &mdash; {activeBranch?.name ?? "main"}
-          </span>
-          <div className="flex shrink-0 items-center gap-1.5">
-            <span>Rev {session.revision_history.length} · {session.checked_out_version_id || "<none>"}</span>
-            <Button
-              type="button"
-              variant="ghost"
-              size="icon-xs"
-              onClick={handleStartWalkthrough}
-              aria-label="Restart walkthrough"
-              title="Restart walkthrough"
-            >
-              <CircleHelp className="h-3.5 w-3.5" />
-            </Button>
-          </div>
-        </footer>
-
-        <WalkthroughPromptModal
-          open={walkthroughPromptState.annotation}
-          mode="annotation"
-          onStart={handleStartWalkthrough}
-          onDismiss={handleDismissWalkthroughPrompt}
-          onDontShowAgain={handleDontShowWalkthroughAgain}
-        />
-
-        {showWalkthroughTour ? (
-          <WalkthroughTour
-            onClose={handleCloseWalkthroughTour}
-            onStepTargetChange={setWalkthroughFocusedTarget}
-          />
-        ) : null}
-
-        {fixJob && currentFixStep && annotationLiveOutputOpen ? (
-          <FixStepLiveModal
-            open
-            job={fixJob}
-            step={currentFixStep}
-            logs={currentFixLogs}
-            onClose={() => setAnnotationLiveOutputOpen(false)}
-          />
-        ) : null}
-
-        {runnerAuthDialog}
-      </div>
-    </TooltipProvider>
+    <AnnotationWorkspaceScreen
+      notifications={notifications}
+      onDismissNotification={dismissNotification}
+      toolbarProps={{
+        mode: "annotation",
+        connected,
+        branches: session.branches,
+        activeBranchId: session.active_branch_id,
+        checkedOutVersionId: session.checked_out_version_id,
+        wsUrl,
+        reconnectAttempts,
+        lastConnectedAt,
+        lastDisconnectedAt,
+        opencodeModels,
+        opencodeModelsLoading,
+        opencodeModelsError,
+        availableRunners,
+        selectedRunner,
+        onChangeRunner: handleToolbarRunnerChange,
+        selectedModel: effectiveSelectedModel,
+        selectedVariant: effectiveSelectedVariant,
+        onChangeModel: handleToolbarModelChange,
+        onChangeVariant: handleToolbarVariantChange,
+        pythonInterpreterState: pythonInterpreter,
+        pythonInterpreterLoading,
+        pythonInterpreterError,
+        onRefreshPythonInterpreter: refreshPythonInterpreter,
+        onSavePythonInterpreter: handleSavePythonInterpreter,
+        runnerStatus,
+        runnerStatusLoading,
+        runnerStatusError: runnerManagerError ?? runnerStatusError,
+        onInstallRunner: handleInstallRunner,
+        onAuthenticateRunner: handleAuthenticateRunner,
+        onOpenRunnerGuide: handleOpenRunnerGuide,
+        onRefreshRunners: handleRefreshRunners,
+        updateStatus,
+        updateStatusLoading,
+        onRefreshUpdateStatus: refreshUpdateStatus,
+        onOpenReleasePage: handleOpenLatestRelease,
+      }}
+      showWorkspaceSidebar={showWorkspaceSidebar}
+      onWorkspaceHotzoneEnter={handleWorkspaceHotzoneEnter}
+      onWorkspaceHotzoneLeave={handleWorkspaceHotzoneLeave}
+      sessionSidebarProps={{
+        sessions,
+        activeWorkspaceId,
+        plotWorkspaceBusyById,
+        actionPending: sessionActionPending,
+        onSelectSession: (sessionId) => {
+          void handleSidebarSelectSession(sessionId);
+        },
+        onNewSession: () => {
+          void handleSidebarCreateSession();
+        },
+        onRenameWorkspace: (sessionId, workspaceName) => {
+          void handleRenameWorkspace(sessionId, workspaceName);
+        },
+        onDeleteWorkspace: (sessionId) => {
+          void handleDeleteWorkspace(sessionId);
+        },
+        pinned: workspacePanelPinned,
+        onTogglePinned: handleToggleWorkspacePanelPinned,
+        onPanelMouseEnter: handleWorkspacePanelMouseEnter,
+        onPanelMouseLeave: handleWorkspacePanelMouseLeave,
+        onClose: handleWorkspacePanelClose,
+      }}
+      plotViewerKey={`${session.id}:${session.checked_out_version_id || "none"}:${plotVersion}`}
+      plotViewerProps={{
+        imageUrl: activePlotUrl,
+        workspaceId: session.id,
+        annotations: activeBranchAnnotations,
+        focusedAnnotationId: focusedAnnotationIdForBranch,
+        onAddAnnotation: addAnnotation,
+        fixStatusBubble,
+        onSelectionActivityChange: setAnnotationSelectionActive,
+        onGraphHoverChange: setIsPlotRegionHovered,
+      }}
+      feedbackSidebarProps={{
+        annotations: session.annotations,
+        versions: session.versions,
+        branches: session.branches,
+        rootVersionId: session.root_version_id,
+        activeBranchId: session.active_branch_id,
+        checkedOutVersionId: session.checked_out_version_id,
+        onSwitchBranch: async (branchId) => {
+          await switchBranch(branchId);
+          setFocusedAnnotationId(null);
+        },
+        onRenameBranch: renameBranch,
+        focusedAnnotationId: focusedAnnotationIdForBranch,
+        onSelectInitialState: handleSelectInitialState,
+        onSelectAnnotation: handleSelectAnnotation,
+        onDownload: handleDownloadAnnotation,
+        onDelete: deleteAnnotation,
+        onUpdate: updateAnnotation,
+        selectedRunner,
+        selectedModel: effectiveSelectedModel,
+        selectedVariant: effectiveSelectedVariant,
+        opencodeModelsLoading,
+        opencodeModelsError,
+        fixJob,
+        onStartFixJob: startFixJob,
+        onCancelFixJob: cancelFixJob,
+      }}
+      footerSourcePath={session.source_script_path ?? "Static file"}
+      footerPlotType={session.plot_type.toUpperCase()}
+      footerBranchName={activeBranch?.name ?? "main"}
+      footerRevisionCount={session.revision_history.length}
+      footerCheckedOutVersionId={session.checked_out_version_id || "<none>"}
+      onRestartWalkthrough={handleStartWalkthrough}
+      walkthroughPromptOpen={walkthroughPromptState.annotation}
+      onStartWalkthrough={handleStartWalkthrough}
+      onDismissWalkthroughPrompt={handleDismissWalkthroughPrompt}
+      onDontShowWalkthroughAgain={handleDontShowWalkthroughAgain}
+      showWalkthroughTour={showWalkthroughTour}
+      onCloseWalkthroughTour={handleCloseWalkthroughTour}
+      onWalkthroughStepTargetChange={setWalkthroughFocusedTarget}
+      fixStepLiveModalProps={
+        fixJob && currentFixStep && annotationLiveOutputOpen
+          ? {
+              open: true,
+              job: fixJob,
+              step: currentFixStep,
+              logs: currentFixLogs,
+              onClose: () => setAnnotationLiveOutputOpen(false),
+            }
+          : null
+      }
+      runnerAuthDialog={runnerAuthDialog}
+    />
   );
 }
 
