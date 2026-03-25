@@ -570,6 +570,84 @@ describe("PlotModeSidebar", () => {
     expect(fetchSuggestions).toHaveBeenCalledWith("", "data");
   });
 
+  it("shows fetched path suggestions and submits the selected data source", async () => {
+    const onSelectPaths = vi.fn(async () => {});
+
+    await act(async () => {
+      root.render(
+        <PlotModeSidebar
+          state={{
+            ...createPlotModeState(),
+            phase: "awaiting_files",
+            current_script: null,
+            current_script_path: null,
+            current_plot: null,
+          }}
+          desktopViewport={false}
+          forceInitialFileSelection
+          selectingFiles={false}
+          sendingMessage={false}
+          finalizing={false}
+          onFetchPathSuggestions={async () => ({
+            suggestions: [
+              {
+                path: "/tmp/workspace-a/data/sales.csv",
+                display_path: "~/data/sales.csv",
+                is_dir: false,
+                is_file: true,
+              },
+            ],
+            query: "",
+            selection_type: "data",
+            base_dir: "/tmp/workspace-a",
+          })}
+          onSelectPaths={onSelectPaths}
+          onSubmitTabularHint={async () => {}}
+          onSendMessage={async () => {}}
+          onShowError={() => {}}
+          plotModeExecutionMode="quick"
+          onChangePlotModeExecutionMode={async () => {}}
+          onAnswerQuestion={async () => {}}
+          onNext={async () => {}}
+        />,
+      );
+      flushAnimationFrames();
+    });
+
+    const suggestionButton = Array.from(container.querySelectorAll<HTMLButtonElement>('button[type="button"]')).find(
+      (button) => button.textContent?.includes("~/data/sales.csv"),
+    );
+    expect(suggestionButton).not.toBeNull();
+
+    await act(async () => {
+      const input = document.body.querySelector<HTMLInputElement>("input");
+      const setValue = Object.getOwnPropertyDescriptor(HTMLInputElement.prototype, "value")?.set;
+      setValue?.call(input!, "/tmp/workspace-a/data/sales.csv");
+      input!.dispatchEvent(new Event("input", { bubbles: true }));
+      input!.dispatchEvent(new Event("change", { bubbles: true }));
+    });
+
+    const addButton = Array.from(document.body.querySelectorAll<HTMLButtonElement>('button[type="button"]')).find(
+      (button) => button.textContent === "Add",
+    );
+    expect(addButton).not.toBeNull();
+
+    await act(async () => {
+      addButton?.click();
+    });
+
+    const confirmButton = Array.from(document.body.querySelectorAll<HTMLButtonElement>('button[type="button"]')).find(
+      (button) => button.getAttribute("aria-label") === "Use selected sources",
+    );
+    expect(confirmButton).not.toBeNull();
+
+    await act(async () => {
+      confirmButton?.click();
+    });
+
+    expect(onSelectPaths).toHaveBeenCalledWith("data", ["/tmp/workspace-a/data/sales.csv"]);
+  });
+
   it("renders historical question cards as read-only when they are no longer pending", async () => {
     await act(async () => {
       root.render(
@@ -676,6 +754,149 @@ describe("PlotModeSidebar", () => {
         text: "Focus on comparing the first two series.",
       },
     ]);
+  });
+
+  it("advances through pending questions and submits the full answer set", async () => {
+    const onAnswerQuestion = vi.fn(async () => {});
+
+    await act(async () => {
+      root.render(
+        <PlotModeSidebar
+          state={createQuestionState()}
+          desktopViewport={false}
+          forceInitialFileSelection={false}
+          selectingFiles={false}
+          sendingMessage={false}
+          finalizing={false}
+          onFetchPathSuggestions={async () => ({
+            suggestions: [],
+            query: "",
+            selection_type: "data",
+            base_dir: "/tmp",
+          })}
+          onSelectPaths={async () => {}}
+          onSubmitTabularHint={async () => {}}
+          onSendMessage={async () => {}}
+          onShowError={() => {}}
+          plotModeExecutionMode="quick"
+          onChangePlotModeExecutionMode={async () => {}}
+          onAnswerQuestion={onAnswerQuestion}
+          onNext={async () => {}}
+        />,
+      );
+      flushAnimationFrames();
+    });
+
+    const firstOptionButton = Array.from(container.querySelectorAll<HTMLButtonElement>('button[type="button"]')).find(
+      (button) => button.textContent?.includes("Minimal"),
+    );
+    expect(firstOptionButton).not.toBeNull();
+
+    await act(async () => {
+      firstOptionButton?.click();
+    });
+
+    expect(container.textContent).toContain("Pick a color palette");
+
+    const secondOptionButton = Array.from(container.querySelectorAll<HTMLButtonElement>('button[type="button"]')).find(
+      (button) => button.textContent?.includes("Muted"),
+    );
+    expect(secondOptionButton).not.toBeNull();
+
+    await act(async () => {
+      secondOptionButton?.click();
+    });
+
+    expect(onAnswerQuestion).toHaveBeenCalledWith("question-set-1", [
+      {
+        question_id: "question-1",
+        option_ids: ["option-1"],
+        text: null,
+      },
+      {
+        question_id: "question-2",
+        option_ids: ["option-2"],
+        text: null,
+      },
+    ]);
+  });
+
+  it("renders message timestamps and submits composer prompts", async () => {
+    const onSendMessage = vi.fn(async () => {});
+    const createdAt = "2026-03-18T19:00:00Z";
+    const expectedTimestamp = new Date(Date.parse(createdAt)).toLocaleTimeString([], {
+      hour: "numeric",
+      minute: "2-digit",
+    });
+
+    await act(async () => {
+      root.render(
+        <PlotModeSidebar
+          state={{
+            ...createPlotModeState(),
+            messages: [
+              {
+                id: "user-1",
+                role: "user",
+                content: "Please compare the first two series.",
+                metadata: null,
+                created_at: createdAt,
+              },
+              {
+                id: "assistant-1",
+                role: "assistant",
+                content: "Latest draft update",
+                metadata: null,
+                created_at: createdAt,
+              },
+            ],
+          }}
+          desktopViewport={false}
+          forceInitialFileSelection={false}
+          selectingFiles={false}
+          sendingMessage={false}
+          finalizing={false}
+          onFetchPathSuggestions={async () => ({
+            suggestions: [],
+            query: "",
+            selection_type: "data",
+            base_dir: "/tmp",
+          })}
+          onSelectPaths={async () => {}}
+          onSubmitTabularHint={async () => {}}
+          onSendMessage={onSendMessage}
+          onShowError={() => {}}
+          plotModeExecutionMode="quick"
+          onChangePlotModeExecutionMode={async () => {}}
+          onAnswerQuestion={async () => {}}
+          onNext={async () => {}}
+        />,
+      );
+      flushAnimationFrames();
+    });
+
+    expect(container.textContent).toContain(expectedTimestamp);
+
+    const textarea = container.querySelector<HTMLTextAreaElement>("textarea");
+    expect(textarea).not.toBeNull();
+
+    await act(async () => {
+      const setValue = Object.getOwnPropertyDescriptor(HTMLTextAreaElement.prototype, "value")?.set;
+      setValue?.call(textarea!, "Tighten the legend labels.");
+      textarea!.dispatchEvent(new Event("input", { bubbles: true }));
+      textarea!.dispatchEvent(new Event("change", { bubbles: true }));
+    });
+
+    const form = container.querySelector<HTMLFormElement>("form");
+    expect(form).not.toBeNull();
+
+    await act(async () => {
+      form?.requestSubmit();
+    });
+
+    expect(onSendMessage).toHaveBeenCalledWith("Tighten the legend labels.");
+    const refreshedTextarea = container.querySelector<HTMLTextAreaElement>("textarea");
+    expect(refreshedTextarea?.value).toBe("");
   });
 
   it("uses a narrow desktop reveal strip for the prompt composer", async () => {

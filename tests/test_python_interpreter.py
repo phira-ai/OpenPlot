@@ -1,11 +1,17 @@
 from __future__ import annotations
 
+import asyncio
+import json
 import sys
 from pathlib import Path
+from typing import Any, cast
 
+import pytest
 from fastapi.testclient import TestClient
 
 import openplot.server as server
+from openplot.services import runners as runner_services
+from openplot.services.runtime import build_test_runtime, get_shared_runtime
 
 
 def _init_workspace(project_dir: Path) -> None:
@@ -17,6 +23,21 @@ def _make_manual_wrapper(path: Path) -> Path:
     wrapper.write_text(f'#!/bin/sh\n"{Path(sys.executable).resolve()}" "$@"\n')
     wrapper.chmod(0o755)
     return wrapper
+
+
+def test_set_workspace_dir_returns_resolved_path_and_updates_shared_workspace(
+    tmp_path: Path,
+) -> None:
+    project_dir = tmp_path / "nested" / "project"
+    project_dir.mkdir(parents=True)
+
+    previous = server._workspace_dir
+    try:
+        resolved = server.set_workspace_dir(project_dir / ".." / "project")
+        assert resolved == project_dir.resolve()
+        assert server._workspace_dir == project_dir.resolve()
+    finally:
+        server._workspace_dir = previous
 
 
 def test_python_interpreter_defaults_to_built_in_runtime(
@@ -145,3 +166,87 @@ def test_python_probe_supports_packaged_app_launcher(
     packages, package_error = server._probe_python_packages(launcher_path)
     assert package_error is None
     assert isinstance(packages, list)
+
+
+def test_python_interpreter_endpoint_uses_injected_runtime_state(
+    monkeypatch,
+    tmp_path: Path,
+) -> None:
+    monkeypatch.setenv("XDG_STATE_HOME", str(tmp_path / "state"))
+    runtime = build_test_runtime(store_root=tmp_path / "isolated-state")
+    shared_runtime = get_shared_runtime()
+
+    script_path = tmp_path / "workspace" / "plot.py"
+    script_path.parent.mkdir(parents=True, exist_ok=True)
+    script_path.write_text(
+        "import matplotlib\n"
+        "matplotlib.use('Agg')\n"
+        "import matplotlib.pyplot as plt\n"
+        "plt.plot([1], [1])\n"
+        "plt.savefig('plot.png')\n"
+    )
+    assert server.init_session_from_script(script_path, runtime=runtime).success
+    shared_runtime.store.active_session = None
+    shared_runtime.store.active_session_id = None
+
+    with TestClient(server.create_app(runtime=runtime)) as client:
+        response = client.get("/api/python/interpreter")
+
+    assert response.status_code == 200
+    assert response.json()["context_dir"] == str(script_path.parent.resolve())
+
+
+def test_python_interpreter_invalid_mode_error_lists_auto() -> None:
+    runtime = build_test_runtime()
+    body = type("InvalidInterpreterRequest", (), {"mode": "invalid", "path": None})()
+
+    with pytest.raises(server.HTTPException) as exc_info:
+        asyncio.run(runner_services.set_python_interpreter(cast(Any, body), runtime))
+
+    assert exc_info.value.status_code == 400
+    assert exc_info.value.detail == "Mode must be 'builtin', 'manual', or 'auto'"
+
+
+def test_python_interpreter_service_uses_injected_runtime_store_root(
+    monkeypatch,
+    tmp_path: Path,
+) -> None:
+    monkeypatch.setenv("OPENPLOT_STATE_DIR", str(tmp_path / "shared-state"))
+    runtime = build_test_runtime(store_root=tmp_path / "isolated-state")
+    assert runtime.state_root is not None
+    runtime_state_root = runtime.state_root.resolve()
+    project_dir = tmp_path / "project"
+    project_dir.mkdir(parents=True)
+    manual_wrapper = _make_manual_wrapper(project_dir)
+
+    server._with_runtime(runtime, lambda: server.set_workspace_dir(project_dir))
+
+    set_payload = asyncio.run(
+        runner_services.set_python_interpreter(
+            cast(
+                Any,
+                type(
+                    "ManualInterpreterRequest",
+                    (),
+                    {"mode": "manual", "path": str(manual_wrapper)},
+                )(),
+            ),
+            runtime,
+        )
+    )
+    get_payload = asyncio.run(runner_services.get_python_interpreter(runtime))
+
+    runtime_preferences = runtime_state_root / "preferences.json"
+    shared_preferences = (tmp_path / "shared-state" / "preferences.json").resolve()
+
+    assert set_payload["mode"] == "manual"
+    assert set_payload["configured_path"] == str(manual_wrapper)
+    assert set_payload["state_root"] == str(runtime_state_root)
+    assert get_payload["mode"] == "manual"
+    assert get_payload["configured_path"] == str(manual_wrapper)
+    assert get_payload["state_root"] == str(runtime_state_root)
+    assert runtime_preferences.exists()
+    assert json.loads(runtime_preferences.read_text())["python_interpreter"] == str(
+        manual_wrapper
+    )
+    assert not shared_preferences.exists()

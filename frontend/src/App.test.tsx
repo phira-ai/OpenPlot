@@ -17,7 +17,7 @@ vi.mock("./hooks/useWebSocket", () => ({
 }));
 
 vi.mock("./hooks/useWorkspaceActions", () => ({
-  useWorkspaceActions: () => useWorkspaceActionsMock(),
+  useWorkspaceActions: (...args: unknown[]) => useWorkspaceActionsMock(...args),
 }));
 
 vi.mock("./components/Toolbar", () => ({
@@ -38,6 +38,14 @@ vi.mock("./components/PlotModePreview", () => ({
 
 vi.mock("./components/PlotModeSidebar", () => ({
   default: () => <div>PlotModeSidebar</div>,
+}));
+
+vi.mock("./components/app/PlotModeScreen", () => ({
+  default: () => <div>PlotModeScreen</div>,
+}));
+
+vi.mock("./components/app/AnnotationWorkspaceScreen", () => ({
+  default: () => <div>AnnotationWorkspaceScreen</div>,
 }));
 
 vi.mock("./components/SessionSidebar", () => ({
@@ -272,6 +280,84 @@ describe("App runner onboarding", () => {
 
     expect(document.body.textContent).toContain("Checking runners");
     expect(document.body.textContent).not.toContain("Open runners");
+  });
+
+  it("passes workspace coordinator callbacks into useWorkspaceActions", async () => {
+    const state = createBaseState({ activeWorkspaceId: "annotation-1" });
+    useSessionStateMock.mockReturnValue(state);
+
+    await act(async () => {
+      root.render(<App />);
+    });
+
+    expect(useWorkspaceActionsMock).toHaveBeenCalledTimes(1);
+    expect(useWorkspaceActionsMock.mock.calls[0]?.[0]).toEqual(
+      expect.objectContaining({
+        activeWorkspaceId: "annotation-1",
+        createNewSession: state.createNewSession,
+        activateSession: state.activateSession,
+        renameWorkspace: state.renameWorkspace,
+        deleteWorkspace: expect.any(Function),
+      }),
+    );
+  });
+
+  it("delegates plot mode rendering to PlotModeScreen", async () => {
+    useSessionStateMock.mockReturnValue(
+      createBaseState({
+        mode: "plot",
+        plotMode: {
+          id: "plot-1",
+          phase: "ready",
+          workspace_name: "Plot Workspace",
+          workspace_dir: "/tmp/plot-workspace",
+          files: [],
+          input_bundle: null,
+          messages: [],
+          data_profiles: [],
+          resolved_sources: [],
+          active_resolved_source_ids: [],
+          selected_data_profile_id: null,
+          tabular_selector: null,
+          pending_question_set: null,
+          execution_mode: "quick",
+          latest_plan_summary: "",
+          latest_plan_outline: [],
+          latest_plan_plot_type: "svg",
+          latest_plan_actions: [],
+          current_script: "print('plot')",
+          current_script_path: null,
+          current_plot: "/tmp/plot.png",
+          plot_type: "svg",
+          latest_user_goal: "",
+          selected_runner: "opencode",
+          selected_model: "",
+          selected_variant: "",
+          runner_session_ids: {},
+          last_error: null,
+          created_at: "2026-03-18T18:00:00Z",
+          updated_at: "2026-03-18T19:00:00Z",
+        },
+      }),
+    );
+
+    await act(async () => {
+      root.render(<App />);
+    });
+
+    expect(document.body.textContent).toContain("PlotModeScreen");
+    expect(document.body.textContent).not.toContain("AnnotationWorkspaceScreen");
+  });
+
+  it("delegates annotation mode rendering to AnnotationWorkspaceScreen", async () => {
+    useSessionStateMock.mockReturnValue(createBaseState());
+
+    await act(async () => {
+      root.render(<App />);
+    });
+
+    expect(document.body.textContent).toContain("AnnotationWorkspaceScreen");
+    expect(document.body.textContent).not.toContain("PlotModeScreen");
   });
 
 });

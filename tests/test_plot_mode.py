@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import asyncio
+import importlib
 import json
 from pathlib import Path
 from typing import cast
@@ -49,37 +50,6 @@ def _create_persisted_plot_workspace(
         state.phase = phase
     server._touch_plot_mode(state)
     return state
-
-
-@pytest.fixture(autouse=True)
-def _reset_server_state():
-    prev_session = server._session
-    prev_sessions = dict(server._sessions)
-    prev_session_order = list(server._session_order)
-    prev_active_session_id = server._active_session_id
-    prev_plot_mode = server._plot_mode
-    prev_workspace = server._workspace_dir
-    prev_loaded_store_root = server._loaded_session_store_root
-
-    server._session = None
-    server._sessions.clear()
-    server._session_order.clear()
-    server._active_session_id = None
-    server._plot_mode = None
-    server._loaded_session_store_root = None
-
-    try:
-        yield
-    finally:
-        server._session = prev_session
-        server._sessions.clear()
-        server._sessions.update(prev_sessions)
-        server._session_order.clear()
-        server._session_order.extend(prev_session_order)
-        server._active_session_id = prev_active_session_id
-        server._plot_mode = prev_plot_mode
-        server._workspace_dir = prev_workspace
-        server._loaded_session_store_root = prev_loaded_store_root
 
 
 @pytest.fixture(autouse=True)
@@ -195,6 +165,248 @@ def test_plot_mode_activate_updates_picker_root_to_target_workspace(
     assert state_b.id != state_a.id
 
 
+def test_plot_mode_activate_uses_injected_runtime_state(
+    monkeypatch,
+    app_with_test_runtime,
+    run_with_test_runtime,
+    shared_runtime,
+    test_runtime,
+    tmp_path: Path,
+) -> None:
+    monkeypatch.setenv("XDG_STATE_HOME", str(tmp_path / "state"))
+
+    workspace_a = tmp_path / "workspace-a"
+    workspace_b = tmp_path / "workspace-b"
+    state_a = run_with_test_runtime(
+        lambda: _create_persisted_plot_workspace(workspace_a),
+    )
+    state_b = run_with_test_runtime(
+        lambda: _create_persisted_plot_workspace(workspace_b),
+    )
+    test_runtime.store.plot_mode = state_a
+    test_runtime.store.active_workspace_id = state_a.id
+    shared_runtime.store.plot_mode = None
+    shared_runtime.store.active_workspace_id = None
+
+    with TestClient(app_with_test_runtime) as client:
+        response = client.post("/api/plot-mode/activate", json={"id": state_b.id})
+        assert response.status_code == 200
+        assert test_runtime.store.plot_mode is not None
+        assert test_runtime.store.plot_mode.id == state_b.id
+        assert test_runtime.store.active_workspace_id == state_b.id
+
+    assert shared_runtime.store.plot_mode is None
+
+
+def test_plot_mode_path_suggestions_use_injected_runtime_plot_mode(
+    monkeypatch,
+    app_with_test_runtime,
+    run_with_test_runtime,
+    shared_runtime,
+    test_runtime,
+    tmp_path: Path,
+) -> None:
+    monkeypatch.setenv("XDG_STATE_HOME", str(tmp_path / "state"))
+    workspace = tmp_path / "runtime-workspace"
+    workspace.mkdir(parents=True, exist_ok=True)
+    (workspace / "runtime.csv").write_text("x,y\n1,2\n")
+
+    state = run_with_test_runtime(
+        lambda: server.init_plot_mode_session(
+            workspace_dir=workspace,
+            persist_workspace=False,
+        )
+    )
+    test_runtime.store.active_workspace_id = state.id
+    shared_runtime.store.plot_mode = None
+
+    with TestClient(app_with_test_runtime) as client:
+        response = client.post(
+            "/api/plot-mode/path-suggestions",
+            json={"selection_type": "data", "query": "", "workspace_id": state.id},
+        )
+
+    assert response.status_code == 200
+    assert response.json()["base_dir"] == str(workspace.resolve())
+
+
+def test_plot_mode_chat_uses_injected_runtime_plot_mode(
+    monkeypatch,
+    app_with_test_runtime,
+    run_with_test_runtime,
+    test_runtime,
+    tmp_path: Path,
+) -> None:
+    monkeypatch.setenv("XDG_STATE_HOME", str(tmp_path / "state"))
+    workspace = tmp_path / "runtime-chat"
+    workspace.mkdir(parents=True, exist_ok=True)
+
+    state = run_with_test_runtime(
+        lambda: server.init_plot_mode_session(
+            workspace_dir=workspace,
+            persist_workspace=False,
+        )
+    )
+    state.phase = server.PlotModePhase.awaiting_prompt
+    state.files = [
+        server.PlotModeFile(
+            id="file-1",
+            stored_path=str((workspace / "data.csv").resolve()),
+            name="data.csv",
+            size_bytes=8,
+            content_type="text/csv",
+        )
+    ]
+    test_runtime.store.active_workspace_id = state.id
+
+    captured: dict[str, object] = {}
+
+    async def fake_continue(**kwargs):
+        captured.update(kwargs)
+        return True, None
+
+    monkeypatch.setattr(server, "_continue_plot_mode_planning", fake_continue)
+
+    with TestClient(app_with_test_runtime) as client:
+        response = client.post(
+            "/api/plot-mode/chat",
+            json={"workspace_id": state.id, "message": "make a chart"},
+        )
+
+    assert response.status_code == 200
+    assert captured["state"] is state
+
+
+def test_plot_mode_router_delegates_to_service(
+    monkeypatch,
+    app_with_test_runtime,
+) -> None:
+    plot_mode_service = importlib.import_module("openplot.services.plot_mode")
+
+    called: dict[str, object] = {}
+
+    async def fake_run_plot_mode_chat(body, runtime):
+        called["message"] = body.message
+        called["runtime"] = runtime
+        return {"status": "ok", "plot_mode": {"id": "delegated"}}
+
+    monkeypatch.setattr(
+        plot_mode_service, "run_plot_mode_chat", fake_run_plot_mode_chat
+    )
+
+    with TestClient(app_with_test_runtime) as client:
+        response = client.post(
+            "/api/plot-mode/chat",
+            json={"workspace_id": "workspace-123", "message": "hi"},
+        )
+
+    assert response.status_code == 200
+    assert response.json()["plot_mode"]["id"] == "delegated"
+    assert called["message"] == "hi"
+
+
+def test_artifacts_router_delegates_feedback_to_service(
+    app_with_test_runtime, monkeypatch
+):
+    artifacts_service = importlib.import_module("openplot.services.artifacts")
+
+    called: dict[str, object] = {}
+
+    async def fake_get_feedback(*, session_id=None):
+        called["session_id"] = session_id
+        return {"prompt": "delegated", "annotation_count": 0}
+
+    monkeypatch.setattr(artifacts_service, "get_feedback", fake_get_feedback)
+
+    with TestClient(app_with_test_runtime) as client:
+        response = client.get("/api/feedback", params={"session_id": "session-1"})
+
+    assert response.status_code == 200
+    assert response.json()["prompt"] == "delegated"
+    assert called["session_id"] == "session-1"
+
+
+def test_plot_mode_export_uses_injected_runtime_plot_mode(
+    monkeypatch,
+    app_with_test_runtime,
+    run_with_test_runtime,
+    test_runtime,
+    tmp_path: Path,
+) -> None:
+    monkeypatch.setenv("XDG_STATE_HOME", str(tmp_path / "state"))
+    workspace = tmp_path / "runtime-export"
+    plot_bytes = b"plot-bytes"
+    state = run_with_test_runtime(
+        lambda: _create_persisted_plot_workspace(workspace, plot_bytes=plot_bytes)
+    )
+    state.current_script = _script_code(color="plum")
+    run_with_test_runtime(lambda: server._touch_plot_mode(state))
+    test_runtime.store.active_workspace_id = state.id
+
+    with TestClient(app_with_test_runtime) as client:
+        response = client.get(f"/api/plot-mode/export?workspace_id={state.id}")
+
+    assert response.status_code == 200
+    assert response.headers["content-type"] == "application/zip"
+
+
+def test_plot_endpoint_uses_injected_runtime_session_artifacts(
+    monkeypatch,
+    app_with_test_runtime,
+    test_runtime,
+    shared_runtime,
+    tmp_path: Path,
+) -> None:
+    monkeypatch.setenv("XDG_STATE_HOME", str(tmp_path / "state"))
+    script_path = tmp_path / "isolated.py"
+    script_path.write_text(_script_code(color="teal"))
+
+    result = server.init_session_from_script(script_path, runtime=test_runtime)
+    assert result.success
+    assert test_runtime.store.active_session is not None
+
+    shared_runtime.store.active_session_id = None
+    shared_runtime.store.active_session = None
+    shared_runtime.store.sessions.clear()
+
+    with TestClient(app_with_test_runtime) as client:
+        response = client.get("/api/plot")
+
+    assert response.status_code == 200
+    assert response.headers["content-type"].startswith("image/")
+
+
+def test_plot_endpoint_on_injected_runtime_does_not_dirty_shared_globals(
+    monkeypatch,
+    app_with_test_runtime,
+    shared_runtime,
+    test_runtime,
+    tmp_path: Path,
+) -> None:
+    monkeypatch.setenv("XDG_STATE_HOME", str(tmp_path / "state"))
+    script_path = tmp_path / "isolated-clean.py"
+    script_path.write_text(_script_code(color="orange"))
+
+    result = server.init_session_from_script(script_path, runtime=test_runtime)
+    assert result.success
+
+    shared_runtime.store.sessions.clear()
+    shared_runtime.store.session_order.clear()
+    shared_runtime.store.active_session_id = None
+    shared_runtime.store.active_session = None
+
+    with TestClient(app_with_test_runtime) as client:
+        response = client.get("/api/plot")
+
+    assert response.status_code == 200
+    assert server._sessions == {}
+    assert server._session_order == []
+    assert server._active_session_id is None
+    assert server._session is None
+    assert shared_runtime.store.sessions == {}
+    assert shared_runtime.store.active_session_id is None
+
+
 def test_plot_mode_empty_query_defaults_to_home_for_fresh_workspace(
     monkeypatch,
     tmp_path: Path,
@@ -267,6 +479,62 @@ def test_plot_mode_tilde_query_uses_home_directory_across_platforms(
     assert payload["base_dir"] == str(home_dir.resolve())
     suggested_names = {Path(item["path"]).name for item in payload["suggestions"]}
     assert "chart.py" in suggested_names
+
+
+def test_resolve_local_picker_path_relative_path_does_not_require_home(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    original_expanduser = Path.expanduser
+
+    def guarded_expanduser(self: Path) -> Path:
+        if str(self).startswith("~"):
+            return original_expanduser(self)
+        raise RuntimeError("Could not determine home directory.")
+
+    monkeypatch.setattr(Path, "expanduser", guarded_expanduser)
+
+    resolved = server._resolve_local_picker_path("dataset.csv", base_dir=tmp_path)
+
+    assert resolved == (tmp_path / "dataset.csv").resolve()
+
+
+def test_resolve_local_picker_path_tilde_reports_home_resolution_error(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    monkeypatch.setattr(
+        Path,
+        "expanduser",
+        lambda self: (_ for _ in ()).throw(
+            RuntimeError("Could not determine home directory.")
+        ),
+    )
+
+    with pytest.raises(server.HTTPException) as exc_info:
+        server._resolve_local_picker_path("~/dataset.csv", base_dir=tmp_path)
+
+    assert exc_info.value.status_code == 422
+    assert "Cannot resolve '~'" in str(exc_info.value.detail)
+
+
+def test_display_picker_path_falls_back_to_absolute_path_without_home(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    target = (tmp_path / "dataset.csv").resolve()
+    target.write_text("x,y\n1,2\n")
+    monkeypatch.setattr(
+        server.Path,
+        "home",
+        lambda: (_ for _ in ()).throw(
+            RuntimeError("Could not determine home directory.")
+        ),
+    )
+
+    display = server._display_picker_path(target, as_dir=False)
+
+    assert display == target.as_posix()
 
 
 class _ChunkedTextReader:
@@ -1280,6 +1548,38 @@ def test_finalize_plot_mode_creates_independent_annotation_session_in_shared_wor
     assert matching[0]["session_id"] == payload["session"]["id"]
 
 
+def test_finalize_plot_mode_uses_injected_runtime_state(
+    app_with_test_runtime,
+    shared_runtime,
+    run_with_test_runtime,
+    test_runtime,
+    tmp_path: Path,
+) -> None:
+    shared_runtime.store.active_session_id = None
+    shared_runtime.store.active_session = None
+    shared_runtime.store.sessions.clear()
+
+    workspace = tmp_path / "workspace"
+    workspace.mkdir(parents=True, exist_ok=True)
+    state = run_with_test_runtime(
+        lambda: server.init_plot_mode_session(
+            workspace_dir=workspace,
+            persist_workspace=False,
+        )
+    )
+    state.current_script = _script_code(color="olive")
+    test_runtime.store.active_workspace_id = state.id
+
+    with TestClient(app_with_test_runtime) as client:
+        response = client.post("/api/plot-mode/finalize", json={})
+        assert response.status_code == 200
+        assert test_runtime.store.active_session is not None
+        assert test_runtime.store.active_workspace_id == state.id
+
+    assert shared_runtime.store.active_session_id is None
+    assert shared_runtime.store.sessions == {}
+
+
 def test_plot_mode_workspace_persists_across_restart_after_draft(
     monkeypatch,
     tmp_path: Path,
@@ -1428,6 +1728,37 @@ def test_plot_mode_workspace_persists_across_restart_after_draft(
         assert bootstrap_payload["plot_mode"]["current_script"] == generated_script
 
 
+def test_plot_mode_active_workspace_hydrates_through_zero_arg_app_restart(
+    monkeypatch,
+    reset_shared_runtime_state,
+    tmp_path: Path,
+) -> None:
+    monkeypatch.setenv("XDG_STATE_HOME", str(tmp_path / "state"))
+
+    workspace = tmp_path / "workspace"
+    state = _create_persisted_plot_workspace(workspace, plot_bytes=b"preview")
+    state.current_script = _script_code(color="darkorange")
+    server._touch_plot_mode(state)
+
+    reset_shared_runtime_state()
+
+    with TestClient(server.create_app()) as client:
+        bootstrap_response = client.get("/api/bootstrap")
+        plot_mode_response = client.get("/api/plot-mode")
+
+    assert bootstrap_response.status_code == 200
+    bootstrap_payload = bootstrap_response.json()
+    assert bootstrap_payload["mode"] == "plot"
+    assert bootstrap_payload["plot_mode"]["id"] == state.id
+    assert bootstrap_payload["active_workspace_id"] == state.id
+
+    assert plot_mode_response.status_code == 200
+    plot_mode_payload = plot_mode_response.json()
+    assert plot_mode_payload["mode"] == "plot"
+    assert plot_mode_payload["plot_mode"]["id"] == state.id
+    assert plot_mode_payload["plot_mode"]["current_script"] == state.current_script
+
+
 def test_plot_mode_settings_toggle_updates_execution_mode(
     monkeypatch,
     tmp_path: Path,
@@ -1443,6 +1774,176 @@ def test_plot_mode_settings_toggle_updates_execution_mode(
 
     assert response.status_code == 200
     assert response.json()["plot_mode"]["execution_mode"] == "autonomous"
+
+
+def test_plot_mode_settings_use_injected_runtime_when_shared_annotation_is_active(
+    monkeypatch,
+    app_with_test_runtime,
+    run_with_test_runtime,
+    shared_runtime,
+    test_runtime,
+    tmp_path: Path,
+) -> None:
+    monkeypatch.setenv("XDG_STATE_HOME", str(tmp_path / "state"))
+    shared_script = tmp_path / "shared-session.py"
+    shared_script.write_text(_script_code(color="black"))
+    shared_result = server.init_session_from_script(shared_script)
+    assert shared_result.success
+    assert (
+        shared_runtime.store.active_session is not None or server._session is not None
+    )
+
+    state = run_with_test_runtime(
+        lambda: server.init_plot_mode_session(
+            workspace_dir=tmp_path / "isolated-workspace",
+            persist_workspace=False,
+        )
+    )
+
+    with TestClient(app_with_test_runtime) as client:
+        response = client.patch(
+            "/api/plot-mode/settings",
+            json={"workspace_id": state.id, "execution_mode": "autonomous"},
+        )
+
+        assert test_runtime.store.plot_mode is not None
+        assert (
+            test_runtime.store.plot_mode.execution_mode
+            == server.PlotModeExecutionMode.autonomous
+        )
+
+    assert response.status_code == 200
+    assert response.json()["plot_mode"]["id"] == state.id
+    assert response.json()["plot_mode"]["execution_mode"] == "autonomous"
+
+
+def test_plot_mode_tabular_hint_uses_injected_runtime_when_shared_annotation_is_active(
+    monkeypatch,
+    app_with_test_runtime,
+    shared_runtime,
+    test_runtime,
+    tmp_path: Path,
+) -> None:
+    monkeypatch.setenv("XDG_STATE_HOME", str(tmp_path / "state"))
+    shared_script = tmp_path / "shared-tabular.py"
+    shared_script.write_text(_script_code(color="dimgray"))
+    shared_result = server.init_session_from_script(shared_script)
+    assert shared_result.success
+    assert (
+        shared_runtime.store.active_session is not None or server._session is not None
+    )
+
+    workspace = tmp_path / "isolated-tabular"
+    workspace.mkdir(parents=True, exist_ok=True)
+    data_path = workspace / "ambiguous.csv"
+    data_path.write_text("year,value,,group,count\n2020,1,,A,3\n2021,2,,B,4\n")
+
+    with TestClient(app_with_test_runtime) as client:
+        select_response = client.post(
+            "/api/plot-mode/select-paths",
+            json={"selection_type": "data", "paths": [str(data_path)]},
+        )
+        assert select_response.status_code == 200
+        plot_mode = select_response.json()["plot_mode"]
+        selector = plot_mode["tabular_selector"]
+        assert selector is not None
+
+        hint_response = client.post(
+            "/api/plot-mode/tabular-hint",
+            json={
+                "workspace_id": plot_mode["id"],
+                "selector_id": selector["id"],
+                "regions": [
+                    {
+                        "sheet_id": selector["sheets"][0]["id"],
+                        "row_start": 0,
+                        "row_end": 2,
+                        "col_start": 3,
+                        "col_end": 4,
+                    }
+                ],
+            },
+        )
+
+    assert hint_response.status_code == 200
+    payload = hint_response.json()["plot_mode"]
+    assert payload["id"] == plot_mode["id"]
+    assert payload["pending_question_set"]["purpose"] == "confirm_tabular_range"
+    assert test_runtime.store.active_session is None
+
+
+def test_plot_mode_answer_uses_injected_runtime_when_shared_annotation_is_active(
+    monkeypatch,
+    app_with_test_runtime,
+    shared_runtime,
+    test_runtime,
+    tmp_path: Path,
+) -> None:
+    monkeypatch.setenv("XDG_STATE_HOME", str(tmp_path / "state"))
+    shared_script = tmp_path / "shared-answer.py"
+    shared_script.write_text(_script_code(color="slategray"))
+    shared_result = server.init_session_from_script(shared_script)
+    assert shared_result.success
+    assert (
+        shared_runtime.store.active_session is not None or server._session is not None
+    )
+
+    workspace = tmp_path / "isolated-answer"
+    workspace.mkdir(parents=True, exist_ok=True)
+    data_path = workspace / "data.csv"
+    data_path.write_text("x,y\n1,2\n2,3\n")
+
+    async def _fake_planning(
+        *,
+        state,
+        runner,
+        user_message,
+        model,
+        variant,
+    ):
+        _ = (state, runner, user_message, model, variant)
+        return server.PlotModePlanResult(
+            assistant_text="Plan prepared.",
+            summary="A simple line chart is the strongest fit.",
+            plot_type="line chart",
+            plan_outline=["Plot x against y with clear labels."],
+            data_actions=[
+                "Read the confirmed CSV source and validate the numeric columns."
+            ],
+            ready_to_plot=False,
+            clarification_question="Would you like me to keep refining the plan before drafting?",
+        )
+
+    monkeypatch.setattr(server, "_run_plot_mode_planning", _fake_planning)
+
+    with TestClient(app_with_test_runtime) as client:
+        select_response = client.post(
+            "/api/plot-mode/select-paths",
+            json={"selection_type": "data", "paths": [str(data_path)]},
+        )
+        assert select_response.status_code == 200
+        plot_mode = select_response.json()["plot_mode"]
+        pending_question = plot_mode["pending_question_set"]
+
+        answer_response = client.post(
+            "/api/plot-mode/answer",
+            json={
+                "workspace_id": plot_mode["id"],
+                "question_set_id": pending_question["id"],
+                "answers": [
+                    {
+                        "question_id": pending_question["questions"][0]["id"],
+                        "option_ids": ["use_preview"],
+                    }
+                ],
+            },
+        )
+
+    assert answer_response.status_code == 200
+    payload = answer_response.json()["plot_mode"]
+    assert payload["id"] == plot_mode["id"]
+    assert payload["pending_question_set"]["purpose"] == "continue_plot_planning"
+    assert test_runtime.store.active_session is None
 
 
 def test_plot_mode_multiple_csvs_skip_the_source_selection_question(
