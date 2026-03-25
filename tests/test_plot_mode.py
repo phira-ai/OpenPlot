@@ -481,6 +481,62 @@ def test_plot_mode_tilde_query_uses_home_directory_across_platforms(
     assert "chart.py" in suggested_names
 
 
+def test_resolve_local_picker_path_relative_path_does_not_require_home(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    original_expanduser = Path.expanduser
+
+    def guarded_expanduser(self: Path) -> Path:
+        if str(self).startswith("~"):
+            return original_expanduser(self)
+        raise RuntimeError("Could not determine home directory.")
+
+    monkeypatch.setattr(Path, "expanduser", guarded_expanduser)
+
+    resolved = server._resolve_local_picker_path("dataset.csv", base_dir=tmp_path)
+
+    assert resolved == (tmp_path / "dataset.csv").resolve()
+
+
+def test_resolve_local_picker_path_tilde_reports_home_resolution_error(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    monkeypatch.setattr(
+        Path,
+        "expanduser",
+        lambda self: (_ for _ in ()).throw(
+            RuntimeError("Could not determine home directory.")
+        ),
+    )
+
+    with pytest.raises(server.HTTPException) as exc_info:
+        server._resolve_local_picker_path("~/dataset.csv", base_dir=tmp_path)
+
+    assert exc_info.value.status_code == 422
+    assert "Cannot resolve '~'" in str(exc_info.value.detail)
+
+
+def test_display_picker_path_falls_back_to_absolute_path_without_home(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    target = (tmp_path / "dataset.csv").resolve()
+    target.write_text("x,y\n1,2\n")
+    monkeypatch.setattr(
+        server.Path,
+        "home",
+        lambda: (_ for _ in ()).throw(
+            RuntimeError("Could not determine home directory.")
+        ),
+    )
+
+    display = server._display_picker_path(target, as_dir=False)
+
+    assert display == target.as_posix()
+
+
 class _ChunkedTextReader:
     def __init__(self, payload: str):
         self._payload = payload.encode("utf-8")

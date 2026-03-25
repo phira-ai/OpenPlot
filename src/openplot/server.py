@@ -211,6 +211,7 @@ _default_fix_runner: FixRunner = "opencode"
 _default_opencode_model = "openai/gpt-5.3-codex"
 _default_codex_model = "gpt-5.2-codex"
 _default_claude_model = "claude-sonnet-4-6"
+_opencode_fix_agent_name = "openplot-fix-runner"
 _extra_command_search_paths = (
     "/opt/homebrew/bin",
     "/opt/homebrew/sbin",
@@ -2175,7 +2176,7 @@ def _is_internal_plot_mode_workspace_dir(path: Path) -> bool:
 def _common_parent_dir(paths: list[Path]) -> Path | None:
     resolved_dirs: list[Path] = []
     for path in paths:
-        resolved = path.expanduser().resolve()
+        resolved = _expanduser_if_needed(path).resolve()
         resolved_dirs.append(resolved if resolved.is_dir() else resolved.parent)
 
     if not resolved_dirs:
@@ -2205,7 +2206,7 @@ def _plot_mode_picker_base_dir(state: PlotModeState) -> Path:
 
     workspace_dir = Path(state.workspace_dir).resolve()
     if _is_internal_plot_mode_workspace_dir(workspace_dir):
-        return Path.home().resolve()
+        return _picker_default_base_dir()
 
     return workspace_dir
 
@@ -2220,7 +2221,7 @@ def _plot_mode_workspace_base_dir(workspace_id: str | None) -> Path:
         return _plot_mode_picker_base_dir(_plot_mode)
     fallback_dir = _workspace_dir.resolve()
     if _is_internal_plot_mode_workspace_dir(fallback_dir):
-        return Path.home().resolve()
+        return _picker_default_base_dir()
     return fallback_dir
 
 
@@ -2319,13 +2320,36 @@ def _reset_plot_mode_runtime_state() -> None:
     _plot_mode = None
 
 
+def _resolved_home_dir() -> Path | None:
+    try:
+        return Path.home().resolve()
+    except RuntimeError:
+        return None
+
+
+def _picker_default_base_dir() -> Path:
+    return _resolved_home_dir() or Path.cwd().resolve()
+
+
+def _expanduser_if_needed(path: Path) -> Path:
+    if not str(path).startswith("~"):
+        return path
+    return path.expanduser()
+
+
 def _resolve_local_picker_path(raw_path: str, *, base_dir: Path | None = None) -> Path:
     resolved_base_dir = (base_dir or _workspace_dir).resolve()
     text = raw_path.strip()
     if not text:
         return resolved_base_dir
 
-    candidate = Path(text).expanduser()
+    try:
+        candidate = _expanduser_if_needed(Path(text))
+    except RuntimeError as exc:
+        raise HTTPException(
+            status_code=422,
+            detail="Cannot resolve '~' because the home directory is unavailable.",
+        ) from exc
     if candidate.is_absolute():
         return candidate.resolve()
     return (resolved_base_dir / candidate).resolve()
@@ -2349,17 +2373,20 @@ def _picker_parent_and_fragment(
 
 
 def _display_picker_path(path: Path, *, as_dir: bool) -> str:
-    resolved = path.expanduser().resolve()
-    home = Path.home().resolve()
+    resolved = path.resolve()
+    home = _resolved_home_dir()
 
-    try:
-        relative_to_home = resolved.relative_to(home)
-        if str(relative_to_home) == ".":
-            display = "~"
-        else:
-            display = f"~/{relative_to_home.as_posix()}"
-    except ValueError:
+    if home is None:
         display = resolved.as_posix()
+    else:
+        try:
+            relative_to_home = resolved.relative_to(home)
+            if str(relative_to_home) == ".":
+                display = "~"
+            else:
+                display = f"~/{relative_to_home.as_posix()}"
+        except ValueError:
+            display = resolved.as_posix()
 
     if as_dir and not display.endswith("/"):
         return f"{display}/"
@@ -7480,6 +7507,8 @@ def _build_opencode_plot_fix_command(
         str(resolved_workspace_dir),
         "--format",
         "json",
+        "--agent",
+        _opencode_fix_agent_name,
         "--model",
         model,
     ]
@@ -7497,6 +7526,7 @@ def _opencode_fix_config_content() -> str:
     mcp_launch = _resolve_openplot_mcp_launch_command()
     config = {
         "$schema": "https://opencode.ai/config.json",
+        "default_agent": _opencode_fix_agent_name,
         "mcp": {
             "openplot": {
                 "type": "local",
@@ -7506,7 +7536,36 @@ def _opencode_fix_config_content() -> str:
             }
         },
         "permission": {"question": "deny"},
-        "tools": {"openplot_*": True},
+        "tools": {
+            "write": True,
+            "edit": True,
+            "patch": True,
+            "bash": True,
+            "read": True,
+            "grep": True,
+            "glob": True,
+            "list": True,
+            "webfetch": True,
+            "openplot_*": True,
+        },
+        "agent": {
+            _opencode_fix_agent_name: {
+                "mode": "primary",
+                "tools": {
+                    "write": True,
+                    "edit": True,
+                    "patch": True,
+                    "bash": True,
+                    "read": True,
+                    "grep": True,
+                    "glob": True,
+                    "list": True,
+                    "webfetch": True,
+                    "openplot_*": True,
+                },
+                "permission": {"question": "deny"},
+            }
+        },
     }
     return json.dumps(config)
 
@@ -7518,6 +7577,42 @@ def _opencode_question_tool_disabled_config_content() -> str:
             "permission": {"question": "deny"},
         }
     )
+
+
+def _merge_opencode_config_objects(base: object, override: object) -> object:
+    if not isinstance(base, dict) or not isinstance(override, dict):
+        return override
+
+    merged = dict(base)
+    for key, value in override.items():
+        merged[key] = _merge_opencode_config_objects(merged.get(key), value)
+    return merged
+
+
+def _merged_opencode_config_content(
+    base_content: str | None, override_content: str
+) -> str:
+    try:
+        override_payload = json.loads(override_content)
+    except json.JSONDecodeError:
+        return override_content
+    if not isinstance(override_payload, dict):
+        return override_content
+
+    if not base_content:
+        return override_content
+
+    try:
+        base_payload = json.loads(base_content)
+    except json.JSONDecodeError:
+        return override_content
+    if not isinstance(base_payload, dict):
+        return override_content
+
+    merged = _merge_opencode_config_objects(base_payload, override_payload)
+    if not isinstance(merged, dict):
+        return override_content
+    return json.dumps(merged)
 
 
 def _build_codex_plot_fix_prompt(*, extra_prompt: str | None = None) -> str:
@@ -7901,6 +7996,17 @@ def _fix_runner_env_overrides(job: FixJob, session: PlotSession) -> dict[str, st
         "PATH": os.pathsep.join(path_entries),
     }
 
+    if job.runner == "opencode":
+        overrides.update(
+            {
+                "OPENCODE_CONFIG_CONTENT": _merged_opencode_config_content(
+                    os.getenv("OPENCODE_CONFIG_CONTENT"),
+                    _opencode_fix_config_content(),
+                ),
+                "OPENCODE_DISABLE_CLAUDE_CODE": "1",
+            }
+        )
+
     runtime_executable = Path(sys.executable).expanduser().resolve()
     if not _is_openplot_app_launcher_path(runtime_executable):
         package_src_root = Path(__file__).resolve().parent.parent
@@ -7915,8 +8021,6 @@ def _fix_runner_env_overrides(job: FixJob, session: PlotSession) -> dict[str, st
     backend_url = _backend_url_from_port_file()
     if backend_url:
         overrides["OPENPLOT_SERVER_URL"] = backend_url
-
-    overrides["OPENCODE_CONFIG_CONTENT"] = _opencode_fix_config_content()
 
     return overrides
 
@@ -9314,6 +9418,7 @@ async def _run_opencode_fix_iteration(
 ) -> None:
     session = _session_for_fix_job(job)
     workspace_dir = _workspace_dir_for_fix_job(job, session)
+    runtime_dir = _runtime_dir_for_fix_job(job, session)
     env_overrides = _fix_runner_env_overrides(job, session)
     resume_session_id = _runner_session_id_for_session(session, "opencode")
     command = _build_opencode_plot_fix_command(
@@ -9329,7 +9434,7 @@ async def _run_opencode_fix_iteration(
         step=step,
         command=command,
         display_command=display_command,
-        cwd=workspace_dir,
+        cwd=runtime_dir,
         env_overrides=env_overrides,
     )
 
@@ -9350,7 +9455,7 @@ async def _run_opencode_fix_iteration(
             step=step,
             command=command,
             display_command=display_command,
-            cwd=workspace_dir,
+            cwd=runtime_dir,
             env_overrides=env_overrides,
         )
 
@@ -9375,7 +9480,7 @@ async def _run_opencode_fix_iteration(
             step=step,
             command=command,
             display_command=display_command,
-            cwd=workspace_dir,
+            cwd=runtime_dir,
             env_overrides=env_overrides,
         )
 

@@ -1259,8 +1259,18 @@ def test_build_fix_command_uses_json_streaming() -> None:
     format_index = command.index("--format")
     assert command[format_index + 1] == "json"
     assert "--thinking" not in command
-    assert "--agent" not in command
+    assert "--agent" in command
     assert command[-1] == server._build_codex_plot_fix_prompt()
+
+
+def test_build_fix_command_uses_dedicated_writable_agent() -> None:
+    command = server._build_opencode_plot_fix_command(
+        model="openai/gpt-5.3-codex",
+        variant="high",
+    )
+
+    agent_index = command.index("--agent")
+    assert command[agent_index + 1] == "openplot-fix-runner"
 
 
 def test_build_codex_plot_fix_prompt_references_actual_mcp_tool_names() -> None:
@@ -1300,6 +1310,19 @@ def test_opencode_fix_config_content_denies_builtin_question_tool() -> None:
     payload = json.loads(server._opencode_fix_config_content())
 
     assert payload["permission"]["question"] == "deny"
+
+
+def test_opencode_fix_config_content_uses_dedicated_writable_agent() -> None:
+    payload = json.loads(server._opencode_fix_config_content())
+
+    assert payload["default_agent"] == "openplot-fix-runner"
+    assert payload["tools"]["write"] is True
+    assert payload["tools"]["edit"] is True
+    assert payload["tools"]["bash"] is True
+    assert payload["agent"]["openplot-fix-runner"]["tools"]["write"] is True
+    assert payload["agent"]["openplot-fix-runner"]["tools"]["edit"] is True
+    assert payload["agent"]["openplot-fix-runner"]["tools"]["bash"] is True
+    assert payload["agent"]["openplot-fix-runner"]["tools"]["openplot_*"] is True
 
 
 def test_opencode_plot_mode_config_only_disables_builtin_question_tool() -> None:
@@ -1547,13 +1570,13 @@ def test_fix_runner_env_overrides_include_runtime_shims(
 
     assert overrides["OPENPLOT_SESSION_ID"] == "session-123"
     assert overrides["OPENPLOT_SERVER_URL"] == "http://127.0.0.1:17623"
-    assert (
-        json.loads(overrides["OPENCODE_CONFIG_CONTENT"])["tools"]["openplot_*"] is True
+    assert json.loads(overrides["OPENCODE_CONFIG_CONTENT"])["default_agent"] == (
+        "openplot-fix-runner"
     )
-    assert (
-        json.loads(overrides["OPENCODE_CONFIG_CONTENT"])["permission"]["question"]
-        == "deny"
-    )
+    assert overrides["OPENCODE_DISABLE_CLAUDE_CODE"] == "1"
+    assert "HOME" not in overrides
+    assert "XDG_CONFIG_HOME" not in overrides
+    assert "OPENCODE_CONFIG" not in overrides
     assert "PYTHONPATH" in overrides
 
     path_parts = overrides["PATH"].split(os.pathsep)
@@ -1564,6 +1587,119 @@ def test_fix_runner_env_overrides_include_runtime_shims(
     else:
         assert (runtime_dir / "bin" / "openplot").exists()
         assert (runtime_dir / "bin" / "uv").exists()
+
+
+def test_fix_runner_env_overrides_merge_existing_opencode_config_content(
+    monkeypatch,
+    tmp_path: Path,
+) -> None:
+    runtime_dir = tmp_path / "runtime" / "fix_runner" / "job-merge"
+    session = PlotSession(id="session-merge")
+    job = FixJob(
+        model="openai/gpt-5.3-codex",
+        branch_id="branch-main",
+        branch_name="main",
+        session_id=session.id,
+        workspace_dir=str(runtime_dir),
+    )
+
+    monkeypatch.setattr(server, "_backend_url_from_port_file", lambda: None)
+    monkeypatch.setenv(
+        "OPENCODE_CONFIG_CONTENT",
+        json.dumps(
+            {
+                "model": "custom/model",
+                "tools": {"write": False, "custom_tool": True},
+                "agent": {"existing": {"tools": {"read": False}}},
+            }
+        ),
+    )
+
+    overrides = server._fix_runner_env_overrides(job, session)
+    payload = json.loads(overrides["OPENCODE_CONFIG_CONTENT"])
+
+    assert payload["model"] == "custom/model"
+    assert payload["tools"]["custom_tool"] is True
+    assert payload["tools"]["write"] is True
+    assert payload["agent"]["existing"]["tools"]["read"] is False
+    assert payload["agent"]["openplot-fix-runner"]["tools"]["write"] is True
+
+
+def test_fix_runner_env_overrides_do_not_isolate_non_opencode_runners(
+    monkeypatch,
+    tmp_path: Path,
+) -> None:
+    runtime_dir = tmp_path / "runtime" / "fix_runner" / "job-456"
+    session = PlotSession(id="session-456")
+    job = FixJob(
+        runner="codex",
+        model="gpt-5.2-codex",
+        branch_id="branch-main",
+        branch_name="main",
+        session_id=session.id,
+        workspace_dir=str(runtime_dir),
+    )
+
+    monkeypatch.setattr(server, "_backend_url_from_port_file", lambda: None)
+
+    overrides = server._fix_runner_env_overrides(job, session)
+
+    assert "HOME" not in overrides
+    assert "XDG_CONFIG_HOME" not in overrides
+    assert "OPENCODE_CONFIG" not in overrides
+    assert "OPENCODE_DISABLE_CLAUDE_CODE" not in overrides
+
+
+@pytest.mark.anyio
+async def test_run_opencode_fix_iteration_uses_runtime_cwd_but_workspace_dir(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    workspace_dir = (tmp_path / "workspace").resolve()
+    runtime_dir = (tmp_path / "runtime").resolve()
+    workspace_dir.mkdir(parents=True)
+    runtime_dir.mkdir(parents=True)
+    session = PlotSession(id="session-123")
+    job = FixJob(
+        runner="opencode",
+        model="openai/gpt-5.3-codex",
+        branch_id="branch-main",
+        branch_name="main",
+        session_id=session.id,
+        workspace_dir=str(runtime_dir),
+    )
+    step = FixJobStep(index=0, annotation_id="annotation-1")
+    captured: dict[str, object] = {}
+
+    async def fake_run_fix_iteration_command(**kwargs):
+        captured.update(kwargs)
+        step.exit_code = 0
+        return ("done\n", "")
+
+    monkeypatch.setattr(server, "_session_for_fix_job", lambda _job: session)
+    monkeypatch.setattr(
+        server, "_workspace_dir_for_fix_job", lambda _job, _session: workspace_dir
+    )
+    monkeypatch.setattr(
+        server, "_runtime_dir_for_fix_job", lambda _job, _session: runtime_dir
+    )
+    monkeypatch.setattr(server, "_fix_runner_env_overrides", lambda _job, _session: {})
+    monkeypatch.setattr(
+        server, "_runner_session_id_for_session", lambda _session, _runner: None
+    )
+    monkeypatch.setattr(
+        server, "_run_fix_iteration_command", fake_run_fix_iteration_command
+    )
+    monkeypatch.setattr(
+        server, "_extract_runner_session_id_from_output", lambda _runner, _stdout: None
+    )
+
+    await server._run_opencode_fix_iteration(job, step)
+
+    assert captured["cwd"] == runtime_dir
+    command = cast(list[str], captured["command"])
+    dir_index = command.index("--dir")
+    assert Path(command[dir_index + 1]) == workspace_dir
 
 
 def test_resolve_openplot_mcp_launch_command_for_python_runtime(
