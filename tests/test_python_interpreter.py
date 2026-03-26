@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import asyncio
 import json
+import subprocess
 import sys
 from pathlib import Path
 from typing import Any, cast
@@ -166,6 +167,46 @@ def test_python_probe_supports_packaged_app_launcher(
     packages, package_error = server._probe_python_packages(launcher_path)
     assert package_error is None
     assert isinstance(packages, list)
+
+
+def test_python_interpreter_probe_returns_error_for_decode_failures(
+    monkeypatch,
+    tmp_path: Path,
+) -> None:
+    launcher_path = tmp_path / "python"
+    launcher_path.write_text("#!/bin/sh\nexit 0\n")
+    launcher_path.chmod(0o755)
+
+    def raise_decode_error(*args, **kwargs):
+        raise UnicodeDecodeError("gbk", b"\x8c", 0, 1, "illegal multibyte sequence")
+
+    monkeypatch.setattr(subprocess, "run", raise_decode_error)
+
+    version, error = server._probe_python_interpreter(launcher_path)
+
+    assert version is None
+    assert error is not None
+    assert "decode" in error.lower()
+
+
+def test_python_package_probe_returns_error_for_decode_failures(
+    monkeypatch,
+    tmp_path: Path,
+) -> None:
+    launcher_path = tmp_path / "python"
+    launcher_path.write_text("#!/bin/sh\nexit 0\n")
+    launcher_path.chmod(0o755)
+
+    def raise_decode_error(*args, **kwargs):
+        raise UnicodeDecodeError("gbk", b"\x8c", 0, 1, "illegal multibyte sequence")
+
+    monkeypatch.setattr(subprocess, "run", raise_decode_error)
+
+    packages, error = server._probe_python_packages(launcher_path)
+
+    assert packages == []
+    assert error is not None
+    assert "decode" in error.lower()
 
 
 def test_python_interpreter_endpoint_uses_injected_runtime_state(

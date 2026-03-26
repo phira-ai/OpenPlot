@@ -18,6 +18,7 @@ from mcp.server.fastmcp import Image
 
 from .domain.annotations import pending_annotation_dicts_for_context
 from .domain.regions import region_bounds_from_points, region_zone_hint_from_bounds
+from .runtime_text import decode_bytes
 
 PORT_FILE = Path.home() / ".openplot" / "port"
 
@@ -111,10 +112,15 @@ def _image_format_from_mime(mime_type: str) -> str:
 def _request_json(req: Request, *, timeout_s: float) -> dict:
     try:
         with urlopen(req, timeout=timeout_s) as resp:
-            body = resp.read().decode("utf-8")
-            return json.loads(body) if body else {}
+            body = decode_bytes(resp.read())
+            try:
+                return json.loads(body) if body else {}
+            except json.JSONDecodeError as exc:
+                raise BackendError(
+                    f"Invalid JSON from backend at {req.full_url}: {body}"
+                ) from exc
     except HTTPError as exc:
-        body = exc.read().decode("utf-8", errors="replace")
+        body = decode_bytes(exc.read())
         raise BackendError(f"HTTP {exc.code} for {req.full_url}: {body}") from exc
     except URLError as exc:
         raise BackendError(

@@ -18,6 +18,8 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Literal
 
+from .runtime_text import read_python_source, run_text_subprocess
+
 # Image extensions we look for, ordered by preference (SVG first).
 IMAGE_EXTENSIONS: list[str] = [".svg", ".png", ".jpg", ".jpeg", ".pdf"]
 
@@ -323,7 +325,7 @@ def execute_script_inline(
     t0 = time.monotonic()
 
     try:
-        script_source = script_path.read_text(encoding="utf-8")
+        script_source = read_python_source(script_path)
         os.chdir(work_dir)
         sys.argv = [str(script_path)]
         with contextlib.redirect_stdout(stdout_buffer):
@@ -437,6 +439,7 @@ def _parse_internal_execution_payload(raw_stdout: str) -> dict[str, object] | No
 _WRAPPER_TEMPLATE = """\
 import os
 import sys
+import tokenize
 
 _openplot_capture_dir = {capture_dir!r}
 os.makedirs(_openplot_capture_dir, exist_ok=True)
@@ -507,7 +510,7 @@ _patch_matplotlib()
 # Now exec the real script.
 _script_path = {script_path!r}
 sys.argv = [_script_path]
-with open(_script_path, encoding="utf-8") as _f:
+with tokenize.open(_script_path) as _f:
     _code = _f.read()
 exec(compile(_code, _script_path, "exec"), {{"__name__": "__main__", "__file__": _script_path}})
 """
@@ -588,17 +591,13 @@ def execute_script(
 
     t0 = time.monotonic()
     try:
-        _creation_kwargs: dict[str, object] = {}
-        if sys.platform == "win32":
-            _creation_kwargs["creationflags"] = subprocess.CREATE_NO_WINDOW
+        creationflags = subprocess.CREATE_NO_WINDOW if sys.platform == "win32" else 0
 
-        proc = subprocess.run(
+        proc = run_text_subprocess(
             command,
-            capture_output=True,
-            text=True,
             timeout=timeout,
             cwd=str(work_dir),
-            **_creation_kwargs,
+            creationflags=creationflags,
         )
     except subprocess.TimeoutExpired:
         return ExecutionResult(

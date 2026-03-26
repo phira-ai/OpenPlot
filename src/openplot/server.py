@@ -5,7 +5,6 @@ from __future__ import annotations
 import ast
 import asyncio
 import json
-import locale
 import os
 import platform
 import pkgutil
@@ -109,6 +108,7 @@ from .services.runtime import (
     write_runtime_port_file,
 )
 from .services import runners as runner_services
+from .runtime_text import decode_bytes, read_text_file, run_text_subprocess
 from .services import sessions as session_services
 from .services import annotations as annotation_services
 from .services import artifacts as artifact_services
@@ -126,29 +126,8 @@ if TYPE_CHECKING:
 
 
 def _read_file_text(path: Path) -> str:
-    """Read a text file with robust encoding detection.
-
-    Tries UTF-8 first (strict). If that fails, falls back to the system
-    default encoding (e.g. GBK on Chinese Windows, cp1252 on Western Windows).
-    If both fail, reads as UTF-8 with replacement characters so we never crash.
-    """
-    raw = path.read_bytes()
-    # UTF-8 BOM is a strong signal
-    if raw.startswith(b"\xef\xbb\xbf"):
-        return raw.decode("utf-8-sig")
-    try:
-        return raw.decode("utf-8")
-    except UnicodeDecodeError:
-        pass
-    # Bytes are not valid UTF-8 — use the system default encoding (GBK, cp1252, etc.)
-    fallback = locale.getpreferredencoding(False)
-    if fallback and fallback.lower().replace("-", "") != "utf8":
-        try:
-            return raw.decode(fallback)
-        except (UnicodeDecodeError, LookupError):
-            pass
-    # Last resort — decode as UTF-8 with replacement so we never crash
-    return raw.decode("utf-8", errors="replace")
+    """Read a text file with robust encoding detection."""
+    return read_text_file(path)
 
 
 # ---------------------------------------------------------------------------
@@ -984,8 +963,8 @@ def _opencode_auth_file_has_credentials() -> bool:
     if not path.exists():
         return False
     try:
-        payload = json.loads(path.read_text(encoding="utf-8"))
-    except (OSError, json.JSONDecodeError):
+        payload = json.loads(_read_file_text(path))
+    except (OSError, json.JSONDecodeError, UnicodeDecodeError):
         return False
     if isinstance(payload, dict):
         return any(bool(value) for value in payload.values())
@@ -1141,7 +1120,7 @@ def _launch_runner_auth_terminal(runner: FixRunner) -> None:
             "Launching authentication in Terminal is only supported on macOS and Windows"
         )
 
-    result = subprocess.run(
+    result = run_text_subprocess(
         [
             "osascript",
             "-e",
@@ -1149,8 +1128,6 @@ def _launch_runner_auth_terminal(runner: FixRunner) -> None:
             "-e",
             f'tell application "Terminal" to do script {_apple_script_quote(command)}',
         ],
-        capture_output=True,
-        text=True,
         env=_subprocess_env(),
         check=False,
     )
@@ -1427,16 +1404,24 @@ def _append_runner_install_log(job_id: str, message: str) -> None:
 def _run_install_subprocess(
     command: list[str], *, shell: bool = False
 ) -> subprocess.CompletedProcess[str]:
-    kwargs: dict[str, object] = {
-        "capture_output": True,
-        "text": True,
-        "timeout": 900,
-        "env": _subprocess_env(),
-    }
-    kwargs.update(_no_window_kwargs())
+    no_window_kwargs = _no_window_kwargs()
+    creationflags = cast(int, no_window_kwargs.get("creationflags", 0))
     if shell:
-        return subprocess.run(command[0], shell=True, check=False, **kwargs)
-    return subprocess.run(command, check=False, **kwargs)
+        return run_text_subprocess(
+            command[0],
+            shell=True,
+            check=False,
+            timeout=900,
+            env=_subprocess_env(),
+            creationflags=creationflags,
+        )
+    return run_text_subprocess(
+        command,
+        check=False,
+        timeout=900,
+        env=_subprocess_env(),
+        creationflags=creationflags,
+    )
 
 
 def _resolve_runner_executable_path(runner: FixRunner) -> str | None:
@@ -1537,10 +1522,12 @@ def _normalize_release_version(value: object) -> str | None:
 
 def _fetch_latest_release_payload() -> dict[str, object]:
     payload = json.loads(
-        _read_url_bytes(
-            _latest_release_api_url,
-            headers={"Accept": "application/vnd.github+json"},
-        ).decode("utf-8")
+        decode_bytes(
+            _read_url_bytes(
+                _latest_release_api_url,
+                headers={"Accept": "application/vnd.github+json"},
+            )
+        )
     )
     if not isinstance(payload, dict):
         raise RuntimeError("GitHub release payload was not an object")
@@ -1678,10 +1665,12 @@ def _install_codex_release(job_id: str) -> dict[str, object]:
 
     _append_runner_install_log(job_id, "Fetching latest Codex release metadata")
     payload = json.loads(
-        _read_url_bytes(
-            "https://api.github.com/repos/openai/codex/releases/latest",
-            headers={"Accept": "application/vnd.github+json"},
-        ).decode("utf-8")
+        decode_bytes(
+            _read_url_bytes(
+                "https://api.github.com/repos/openai/codex/releases/latest",
+                headers={"Accept": "application/vnd.github+json"},
+            )
+        )
     )
 
     assets = payload.get("assets") or []
@@ -7264,16 +7253,16 @@ def _refresh_opencode_models_cache(
 
     for command in attempts:
         try:
-            result = subprocess.run(
+            hidden_window_kwargs = _hidden_window_kwargs()
+            creationflags = cast(int, hidden_window_kwargs.get("creationflags", 0))
+            result = run_text_subprocess(
                 command,
                 cwd=str(_workspace_dir),
                 env=_subprocess_env(),
-                capture_output=True,
-                text=True,
                 check=False,
-                **_hidden_window_kwargs(),
+                creationflags=creationflags,
             )
-        except OSError as exc:
+        except (OSError, UnicodeDecodeError) as exc:
             last_error = str(exc)
             continue
 
@@ -8719,18 +8708,20 @@ def _probe_python_interpreter(
     )
 
     try:
-        result = subprocess.run(
+        no_window_kwargs = _no_window_kwargs()
+        creationflags = cast(int, no_window_kwargs.get("creationflags", 0))
+        result = run_text_subprocess(
             [str(interpreter_path), "-c", probe_code],
-            capture_output=True,
-            text=True,
             timeout=timeout_s,
             check=False,
-            **_no_window_kwargs(),
+            creationflags=creationflags,
         )
     except OSError as exc:
         return None, str(exc)
     except subprocess.TimeoutExpired:
         return None, f"Timed out validating interpreter: {interpreter_path}"
+    except UnicodeDecodeError as exc:
+        return None, f"Failed to decode interpreter probe output: {exc}"
 
     if result.returncode != 0:
         details = (result.stderr or result.stdout).strip() or (
@@ -8891,13 +8882,13 @@ def _probe_python_packages(
     )
 
     try:
-        result = subprocess.run(
+        no_window_kwargs = _no_window_kwargs()
+        creationflags = cast(int, no_window_kwargs.get("creationflags", 0))
+        result = run_text_subprocess(
             [str(interpreter_path), "-c", probe_code],
-            capture_output=True,
-            text=True,
             timeout=timeout_s,
             check=False,
-            **_no_window_kwargs(),
+            creationflags=creationflags,
         )
     except OSError as exc:
         return [], str(exc)
@@ -8905,6 +8896,8 @@ def _probe_python_packages(
         return [], (
             f"Timed out validating packages for interpreter: {interpreter_path}"
         )
+    except UnicodeDecodeError as exc:
+        return [], f"Failed to decode package probe output: {exc}"
 
     if result.returncode != 0:
         details = (result.stderr or result.stdout).strip() or (

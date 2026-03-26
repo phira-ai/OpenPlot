@@ -1036,6 +1036,81 @@ def test_runner_auth_probe_returns_false_when_status_command_errors(
     assert server._runner_auth_probe("codex") is False
 
 
+def test_runner_status_endpoint_ignores_invalid_opencode_auth_file_encoding(
+    monkeypatch,
+    tmp_path: Path,
+) -> None:
+    auth_path = tmp_path / "auth.json"
+    auth_path.write_bytes(b"\x8cnot-json")
+
+    def auth_aware_detect() -> dict[str, object]:
+        available_runners: list[str] = []
+        for runner in cast(tuple[FixRunner, ...], ("opencode", "codex", "claude")):
+            if server._runner_launch_probe(runner) and server._runner_auth_probe(
+                runner
+            ):
+                available_runners.append(runner)
+        return {
+            "available_runners": available_runners,
+            "supported_runners": ["opencode", "codex", "claude"],
+            "claude_code_available": "claude" in available_runners,
+        }
+
+    monkeypatch.setattr(
+        server,
+        "_opencode_auth_file_path",
+        lambda: auth_path,
+    )
+    monkeypatch.setattr(server, "_detect_runner_availability", auth_aware_detect)
+    monkeypatch.setattr(
+        server,
+        "_resolve_command_path",
+        lambda command: "/tmp/opencode" if command == "opencode" else None,
+    )
+    monkeypatch.setattr(server, "_resolve_claude_cli_command", lambda: None)
+    monkeypatch.setattr(
+        server,
+        "_runner_launch_probe",
+        lambda runner: runner == "opencode",
+    )
+    monkeypatch.setattr(
+        server,
+        "_run_install_subprocess",
+        lambda command, *, shell=False: subprocess.CompletedProcess(
+            args=command,
+            returncode=0,
+            stdout="no authenticated providers",
+            stderr="",
+        ),
+    )
+
+    with TestClient(server.create_app()) as client:
+        response = client.get("/api/runners/status")
+
+    assert response.status_code == 200
+    payload = response.json()
+    opencode_status = next(
+        item for item in payload["runners"] if item["runner"] == "opencode"
+    )
+    assert opencode_status["status"] == "installed_needs_auth"
+
+
+def test_refresh_opencode_models_cache_wraps_decode_failures(monkeypatch) -> None:
+    monkeypatch.setattr(
+        server,
+        "_resolve_command_path",
+        lambda command: "/tmp/opencode" if command == "opencode" else None,
+    )
+
+    def raise_decode_error(*args, **kwargs):
+        raise UnicodeDecodeError("gbk", b"\x8c", 0, 1, "illegal multibyte sequence")
+
+    monkeypatch.setattr(subprocess, "run", raise_decode_error)
+
+    with pytest.raises(RuntimeError):
+        server._refresh_opencode_models_cache(force_refresh=True)
+
+
 def test_runner_install_endpoint_rejects_guide_only_runners(monkeypatch) -> None:
     monkeypatch.setattr(
         server,

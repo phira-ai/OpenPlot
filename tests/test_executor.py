@@ -87,6 +87,32 @@ def test_execute_script_uses_internal_mode_for_packaged_runtime(
     assert result.stderr == "captured-stderr"
 
 
+def test_execute_script_supports_python_source_with_declared_encoding(
+    tmp_path: Path,
+) -> None:
+    script_path = tmp_path / "plot-latin1.py"
+    script_path.write_bytes(
+        b"# -*- coding: latin-1 -*-\n"
+        b"import matplotlib\n"
+        b"matplotlib.use('Agg')\n"
+        b"import matplotlib.pyplot as plt\n"
+        b"label = 'ol\xe1'\n"
+        b"print(label)\n"
+        b"plt.figure(figsize=(2, 2))\n"
+        b"plt.plot([1, 2], [2, 1])\n"
+        b"plt.title(label)\n"
+        b"plt.tight_layout()\n"
+        b"plt.savefig('plot.png')\n"
+    )
+
+    capture_dir = tmp_path / "capture"
+    result = execute_script(script_path, work_dir=tmp_path, capture_dir=capture_dir)
+
+    assert result.success
+    assert result.plot_path is not None
+    assert "ol\xe1" in result.stdout
+
+
 def test_prepare_matplotlib_runtime_sets_writable_config_dir(tmp_path: Path) -> None:
     capture_dir = tmp_path / "capture"
 
