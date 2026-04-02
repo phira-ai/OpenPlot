@@ -1776,6 +1776,155 @@ def test_plot_mode_settings_toggle_updates_execution_mode(
     assert response.json()["plot_mode"]["execution_mode"] == "autonomous"
 
 
+def test_plot_mode_autonomous_execution_runs_post_draft_review_loop(
+    monkeypatch,
+    tmp_path: Path,
+) -> None:
+    monkeypatch.setenv("XDG_STATE_HOME", str(tmp_path / "state"))
+    workspace = tmp_path / "workspace"
+    server.init_plot_mode_session(workspace_dir=workspace)
+
+    data_path = workspace / "data.csv"
+    data_path.parent.mkdir(parents=True, exist_ok=True)
+    data_path.write_text("x,y\n1,2\n2,3\n")
+
+    preview_plot = workspace / "captures" / "preview.png"
+    preview_plot.parent.mkdir(parents=True, exist_ok=True)
+    preview_plot.write_bytes(b"preview")
+
+    generated_script = _script_code(color="navy")
+    generated_summary = "Generated a polished first draft."
+    review_calls: list[dict[str, object]] = []
+
+    async def _fake_planning(
+        *,
+        state,
+        runner,
+        user_message,
+        model,
+        variant,
+    ):
+        _ = (state, runner, user_message, model, variant)
+        return server.PlotModePlanResult(
+            assistant_text="Ready to draft.",
+            summary="The plan is ready for a first autonomous draft.",
+            plot_type="line chart",
+            plan_outline=["Load the confirmed CSV and render a polished line chart."],
+            data_actions=["Use the selected x/y table."],
+            ready_to_plot=True,
+        )
+
+    async def _fake_generation(
+        *,
+        state,
+        message,
+        model,
+        variant,
+        runner,
+        assistant_message,
+    ):
+        _ = (state, message, model, variant, runner, assistant_message)
+        return server.PlotModeGenerationResult(
+            assistant_text=generated_summary,
+            script=generated_script,
+            execution_result=ExecutionResult(
+                success=True,
+                plot_path=str(preview_plot),
+                plot_type="raster",
+            ),
+        )
+
+    async def _fake_autonomous_reviews(
+        *,
+        state,
+        runner,
+        model,
+        variant,
+        summary_message,
+    ) -> None:
+        review_calls.append(
+            {
+                "runner": runner,
+                "model": model,
+                "variant": variant,
+                "phase": state.phase,
+                "current_script": state.current_script,
+                "current_plot": state.current_plot,
+                "summary_content": (
+                    summary_message.content if summary_message is not None else None
+                ),
+            }
+        )
+
+    monkeypatch.setattr(server, "_run_plot_mode_planning", _fake_planning)
+    monkeypatch.setattr(server, "_run_plot_mode_generation", _fake_generation)
+    monkeypatch.setattr(
+        server, "_run_plot_mode_autonomous_reviews", _fake_autonomous_reviews
+    )
+
+    with TestClient(server.create_app()) as client:
+        select_response = client.post(
+            "/api/plot-mode/select-paths",
+            json={"selection_type": "data", "paths": [str(data_path)]},
+        )
+        assert select_response.status_code == 200
+        plot_mode = select_response.json()["plot_mode"]
+
+        preview_response = client.post(
+            "/api/plot-mode/answer",
+            json={
+                "question_set_id": plot_mode["pending_question_set"]["id"],
+                "answers": [
+                    {
+                        "question_id": plot_mode["pending_question_set"]["questions"][
+                            0
+                        ]["id"],
+                        "option_ids": ["use_preview"],
+                    }
+                ],
+            },
+        )
+        assert preview_response.status_code == 200
+        preview_plot_mode = preview_response.json()["plot_mode"]
+        pending_question = preview_plot_mode["pending_question_set"]
+        assert pending_question is not None
+        assert pending_question["purpose"] == "approve_plot_plan"
+
+        settings_response = client.patch(
+            "/api/plot-mode/settings",
+            json={"execution_mode": "autonomous"},
+        )
+        assert settings_response.status_code == 200
+        assert settings_response.json()["plot_mode"]["execution_mode"] == "autonomous"
+
+        approve_response = client.post(
+            "/api/plot-mode/answer",
+            json={
+                "question_set_id": pending_question["id"],
+                "answers": [
+                    {
+                        "question_id": pending_question["questions"][0]["id"],
+                        "option_ids": ["start_draft"],
+                    }
+                ],
+            },
+        )
+
+    assert approve_response.status_code == 200
+    payload = approve_response.json()["plot_mode"]
+    assert payload["phase"] == "ready"
+    assert payload["current_plot"] == str(preview_plot)
+    assert payload["current_script"] == generated_script
+    assert len(review_calls) == 1
+    assert review_calls[0]["runner"] == payload["selected_runner"]
+    assert review_calls[0]["model"] == payload["selected_model"]
+    assert review_calls[0]["variant"] == (payload["selected_variant"] or None)
+    assert review_calls[0]["phase"] == server.PlotModePhase.drafting
+    assert review_calls[0]["current_script"] == generated_script
+    assert review_calls[0]["current_plot"] == str(preview_plot)
+    assert review_calls[0]["summary_content"] == generated_summary
+
+
 def test_plot_mode_settings_use_injected_runtime_when_shared_annotation_is_active(
     monkeypatch,
     app_with_test_runtime,
