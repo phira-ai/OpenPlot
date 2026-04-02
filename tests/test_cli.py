@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import json
 from pathlib import Path
 import ssl
 import tempfile
@@ -386,8 +387,13 @@ def test_mcp_skips_update_notice_to_keep_stdout_clean(
 def test_update_status_uses_curl_fallback_on_ssl_verification_failure(
     monkeypatch,
 ) -> None:
-    release_payload = (
-        '{"tag_name":"v1.2.0","html_url":"https://github.com/phira-ai/OpenPlot/releases/tag/v1.2.0"}'
+    major, minor, _patch = (int(part) for part in server.__version__.split("."))
+    latest_version = f"{major}.{minor + 1}.0"
+    release_payload = json.dumps(
+        {
+            "tag_name": f"v{latest_version}",
+            "html_url": f"https://github.com/phira-ai/OpenPlot/releases/tag/v{latest_version}",
+        }
     ).encode("utf-8")
 
     def raise_ssl_error(*_args, **_kwargs):
@@ -411,7 +417,7 @@ def test_update_status_uses_curl_fallback_on_ssl_verification_failure(
     payload = server._build_update_status_payload(force_refresh=True)
 
     assert payload["error"] is None
-    assert payload["latest_version"] == "1.2.0"
+    assert payload["latest_version"] == latest_version
     assert payload["update_available"] is True
 
 
