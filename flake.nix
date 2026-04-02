@@ -70,9 +70,9 @@
 
         frontendDist = pkgs.buildNpmPackage {
           pname = "openplot-frontend";
-          version = "1.1.2";
+          version = "1.2.0";
           src = ./frontend;
-          npmDepsHash = "sha256-DTT3pDPsU9nM8OIWG9A1Ck1ey61yox8fHZjaceV1LhQ=";
+          npmDepsHash = "sha256-jBi1XxnFpZWbNs376rHEGmx22nZ8mTJB7m9UUJh9IoM=";
           npmBuildScript = "build";
 
           installPhase = ''
@@ -89,7 +89,7 @@
 
         openplot = pkgs.stdenvNoCC.mkDerivation {
           pname = "openplot";
-          version = "1.1.2";
+          version = "1.2.0";
           src = lib.cleanSource ./.;
           nativeBuildInputs = [ pkgs.makeWrapper ];
 
@@ -115,7 +115,7 @@
 
         openplotDesktop = pkgs.stdenvNoCC.mkDerivation {
           pname = "openplot-desktop";
-          version = "1.1.2";
+          version = "1.2.0";
           src = lib.cleanSource ./.;
           nativeBuildInputs = [
             pkgs.makeWrapper
