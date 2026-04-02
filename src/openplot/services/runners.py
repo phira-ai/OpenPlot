@@ -9,6 +9,11 @@ from typing import TYPE_CHECKING, cast
 
 from fastapi import HTTPException
 
+from .. import server
+from .. import server_python_runtime
+from .. import server_runners
+from .. import server_runtime_bootstrap
+
 if TYPE_CHECKING:
     from ..api.schemas import (
         OpenExternalUrlRequest,
@@ -27,16 +32,14 @@ async def _to_thread_with_runtime(
     *args,
     **kwargs,
 ):
-    from .. import server
-
     return await asyncio.to_thread(
-        lambda: server._with_runtime(runtime, lambda: callback(*args, **kwargs))
+        lambda: server_runtime_bootstrap._with_runtime(
+            server, runtime, lambda: callback(*args, **kwargs)
+        )
     )
 
 
 async def get_preferences() -> dict[str, object]:
-    from .. import server
-
     fix_runner, fix_model, fix_variant = server._load_fix_preferences()
     return {
         "fix_runner": fix_runner,
@@ -46,8 +49,6 @@ async def get_preferences() -> dict[str, object]:
 
 
 async def set_preferences(body: "PreferencesRequest") -> dict[str, object]:
-    from .. import server
-
     current_runner, current_model, current_variant = server._load_fix_preferences()
 
     runner = server._normalize_fix_runner(
@@ -73,12 +74,17 @@ async def set_preferences(body: "PreferencesRequest") -> dict[str, object]:
         variant = current_variant
 
     try:
-        models = await asyncio.to_thread(server._refresh_runner_models_cache, runner)
+        models = await asyncio.to_thread(
+            server_runners._refresh_runner_models_cache,
+            server,
+            runner,
+        )
     except RuntimeError:
         models = []
 
     if model:
-        server._validate_runner_model_selection(
+        server_runners._validate_runner_model_selection(
+            server,
             runner=runner,
             model=model,
             variant=variant,
@@ -106,9 +112,9 @@ async def set_preferences(body: "PreferencesRequest") -> dict[str, object]:
 
 
 async def get_runners() -> dict[str, object]:
-    from .. import server
-
-    availability = await asyncio.to_thread(server._detect_runner_availability)
+    availability = await asyncio.to_thread(
+        server_runners._detect_runner_availability, server
+    )
     return {
         "available_runners": availability["available_runners"],
         "supported_runners": availability["supported_runners"],
@@ -117,18 +123,16 @@ async def get_runners() -> dict[str, object]:
 
 
 async def get_runner_status() -> dict[str, object]:
-    from .. import server
-
-    return await asyncio.to_thread(server._build_runner_status_payload)
+    return await asyncio.to_thread(server_runners._build_runner_status_payload, server)
 
 
 async def install_runner(
     body: "RunnerInstallRequest",
     runtime: "BackendRuntime",
 ) -> dict[str, object]:
-    from .. import server
-
-    payload = await asyncio.to_thread(server._build_runner_status_payload)
+    payload = await asyncio.to_thread(
+        server_runners._build_runner_status_payload, server
+    )
     runner_entries = cast(list[dict[str, object]], payload.get("runners") or [])
     entry = next(
         (item for item in runner_entries if item.get("runner") == body.runner), None
@@ -144,7 +148,8 @@ async def install_runner(
             ),
         )
     job = await asyncio.to_thread(
-        server._create_runner_install_job,
+        server_runners._create_runner_install_job,
+        server,
         body.runner,
         runtime=runtime,
     )
@@ -152,9 +157,9 @@ async def install_runner(
 
 
 async def launch_runner_auth(body: "RunnerAuthLaunchRequest") -> dict[str, object]:
-    from .. import server
-
-    payload = await asyncio.to_thread(server._build_runner_status_payload)
+    payload = await asyncio.to_thread(
+        server_runners._build_runner_status_payload, server
+    )
     runner_entries = cast(list[dict[str, object]], payload.get("runners") or [])
     entry = next(
         (item for item in runner_entries if item.get("runner") == body.runner), None
@@ -168,7 +173,9 @@ async def launch_runner_auth(body: "RunnerAuthLaunchRequest") -> dict[str, objec
                 f"Runner '{body.runner}' is not waiting for Terminal authentication on this machine."
             ),
         )
-    await asyncio.to_thread(server._launch_runner_auth_terminal, body.runner)
+    await asyncio.to_thread(
+        server_runners._launch_runner_auth_terminal, server, body.runner
+    )
     return {
         "status": "ok",
         "auth_command": entry.get("auth_command"),
@@ -185,8 +192,6 @@ async def open_external_url(body: "OpenExternalUrlRequest") -> dict[str, object]
 
 
 async def refresh_update_status(runtime: "BackendRuntime") -> dict[str, object]:
-    from .. import server
-
     return await asyncio.to_thread(
         server.build_update_status_payload,
         runtime,
@@ -200,8 +205,6 @@ async def get_python_interpreter(
     *,
     session_id: str | None = None,
 ) -> dict[str, object]:
-    from .. import server
-
     def _resolve_session_for_python():
         server._ensure_session_store_loaded()
         return (
@@ -210,10 +213,13 @@ async def get_python_interpreter(
             else server._runtime_active_session_value()
         )
 
-    session = server._with_runtime(runtime, _resolve_session_for_python)
+    session = server_runtime_bootstrap._with_runtime(
+        server, runtime, _resolve_session_for_python
+    )
     return await _to_thread_with_runtime(
         runtime,
-        server._resolve_python_interpreter_state,
+        server_python_runtime._resolve_python_interpreter_state,
+        server,
         session,
     )
 
@@ -222,9 +228,9 @@ async def set_python_interpreter(
     body: "PythonInterpreterRequest",
     runtime: "BackendRuntime",
 ) -> dict[str, object]:
-    from .. import server
-
-    server._with_runtime(runtime, lambda: server._ensure_session_store_loaded())
+    server_runtime_bootstrap._with_runtime(
+        server, runtime, lambda: server._ensure_session_store_loaded()
+    )
     mode = body.mode
     if mode not in {"builtin", "manual", "auto"}:
         raise HTTPException(
@@ -236,7 +242,8 @@ async def set_python_interpreter(
         try:
             await _to_thread_with_runtime(
                 runtime,
-                server._save_python_interpreter_preference,
+                server_python_runtime._save_python_interpreter_preference,
+                server,
                 None,
             )
         except OSError as exc:
@@ -244,10 +251,13 @@ async def set_python_interpreter(
                 status_code=500,
                 detail=f"Failed to save interpreter preference: {exc}",
             ) from exc
-        session = server._with_runtime(runtime, server._runtime_active_session_value)
+        session = server_runtime_bootstrap._with_runtime(
+            server, runtime, lambda: server._runtime_active_session_value()
+        )
         return await _to_thread_with_runtime(
             runtime,
-            server._resolve_python_interpreter_state,
+            server_python_runtime._resolve_python_interpreter_state,
+            server,
             session,
         )
 
@@ -261,7 +271,8 @@ async def set_python_interpreter(
 
     candidate, validation_error = await _to_thread_with_runtime(
         runtime,
-        server._validated_python_candidate,
+        server_python_runtime._validated_python_candidate,
+        server,
         Path(path),
         source="manual",
     )
@@ -274,7 +285,8 @@ async def set_python_interpreter(
     try:
         await _to_thread_with_runtime(
             runtime,
-            server._save_python_interpreter_preference,
+            server_python_runtime._save_python_interpreter_preference,
+            server,
             candidate["path"],
         )
     except OSError as exc:
@@ -283,10 +295,13 @@ async def set_python_interpreter(
             detail=f"Failed to save interpreter preference: {exc}",
         ) from exc
 
-    session = server._with_runtime(runtime, server._runtime_active_session_value)
+    session = server_runtime_bootstrap._with_runtime(
+        server, runtime, lambda: server._runtime_active_session_value()
+    )
     return await _to_thread_with_runtime(
         runtime,
-        server._resolve_python_interpreter_state,
+        server_python_runtime._resolve_python_interpreter_state,
+        server,
         session,
     )
 
@@ -296,8 +311,6 @@ async def get_runner_models(
     runner: str = "opencode",
     force_refresh: bool = False,
 ) -> dict[str, object]:
-    from .. import server
-
     normalized_runner = server._normalize_fix_runner(
         runner, default=server._default_fix_runner
     )
@@ -305,7 +318,8 @@ async def get_runner_models(
     fallback_to_empty_models = False
     try:
         models = await asyncio.to_thread(
-            server._refresh_runner_models_cache,
+            server_runners._refresh_runner_models_cache,
+            server,
             normalized_runner,
             force_refresh=force_refresh,
         )

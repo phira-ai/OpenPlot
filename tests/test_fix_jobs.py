@@ -17,6 +17,7 @@ import pytest
 from fastapi.testclient import TestClient
 
 import openplot.server as server
+import openplot.server_runners as server_runners
 from openplot.models import (
     AnnotationStatus,
     FixJob,
@@ -33,14 +34,16 @@ from openplot.services.runtime import build_test_runtime
 @pytest.fixture(autouse=True)
 def _mock_default_runner_availability(monkeypatch, tmp_path: Path):
     monkeypatch.setenv("OPENPLOT_STATE_DIR", str(tmp_path / "state"))
+    availability = {
+        "available_runners": ["opencode", "codex", "claude"],
+        "supported_runners": ["opencode", "codex", "claude"],
+        "claude_code_available": False,
+    }
+    monkeypatch.setattr(server, "_detect_runner_availability", lambda: availability)
     monkeypatch.setattr(
-        server,
+        server_runners,
         "_detect_runner_availability",
-        lambda: {
-            "available_runners": ["opencode", "codex", "claude"],
-            "supported_runners": ["opencode", "codex", "claude"],
-            "claude_code_available": False,
-        },
+        lambda _server_module: availability,
     )
 
 
@@ -668,14 +671,16 @@ def test_fix_job_accepts_claude_runner(monkeypatch, tmp_path: Path) -> None:
 
 
 def test_runners_endpoint_reports_available_backends(monkeypatch) -> None:
+    availability = {
+        "available_runners": ["opencode"],
+        "supported_runners": ["opencode", "codex", "claude"],
+        "claude_code_available": False,
+    }
+    monkeypatch.setattr(server, "_detect_runner_availability", lambda: availability)
     monkeypatch.setattr(
-        server,
+        server_runners,
         "_detect_runner_availability",
-        lambda: {
-            "available_runners": ["opencode"],
-            "supported_runners": ["opencode", "codex", "claude"],
-            "claude_code_available": False,
-        },
+        lambda _server_module: availability,
     )
 
     with TestClient(server.create_app()) as client:
@@ -966,38 +971,45 @@ def test_launch_runner_auth_terminal_uses_powershell_on_windows(monkeypatch) -> 
 
 
 def test_runner_auth_launch_endpoint_uses_runner_command_on_macos(monkeypatch) -> None:
+    payload = {
+        "available_runners": [],
+        "supported_runners": ["opencode", "codex", "claude"],
+        "claude_code_available": False,
+        "host_platform": "darwin",
+        "host_arch": "arm64",
+        "active_install_job_id": None,
+        "runners": [
+            {
+                "runner": "codex",
+                "status": "installed_needs_auth",
+                "status_label": "Authenticate",
+                "primary_action": "authenticate",
+                "primary_action_label": "Authenticate",
+                "guide_url": "https://developers.openai.com/codex/auth",
+                "installed": False,
+                "executable_path": "/tmp/codex",
+                "install_job": None,
+                "auth_command": "codex",
+                "auth_instructions": "Run the command in Terminal and then click Refresh.",
+            }
+        ],
+    }
+    monkeypatch.setattr(server, "_build_runner_status_payload", lambda: payload)
     monkeypatch.setattr(
-        server,
+        server_runners,
         "_build_runner_status_payload",
-        lambda: {
-            "available_runners": [],
-            "supported_runners": ["opencode", "codex", "claude"],
-            "claude_code_available": False,
-            "host_platform": "darwin",
-            "host_arch": "arm64",
-            "active_install_job_id": None,
-            "runners": [
-                {
-                    "runner": "codex",
-                    "status": "installed_needs_auth",
-                    "status_label": "Authenticate",
-                    "primary_action": "authenticate",
-                    "primary_action_label": "Authenticate",
-                    "guide_url": "https://developers.openai.com/codex/auth",
-                    "installed": False,
-                    "executable_path": "/tmp/codex",
-                    "install_job": None,
-                    "auth_command": "codex",
-                    "auth_instructions": "Run the command in Terminal and then click Refresh.",
-                }
-            ],
-        },
+        lambda _server_module: payload,
     )
     launched_commands: list[str] = []
     monkeypatch.setattr(
         server,
         "_launch_runner_auth_terminal",
         lambda runner: launched_commands.append(runner),
+    )
+    monkeypatch.setattr(
+        server_runners,
+        "_launch_runner_auth_terminal",
+        lambda _server_module, runner: launched_commands.append(runner),
     )
 
     with TestClient(server.create_app()) as client:
@@ -1294,14 +1306,16 @@ def test_runner_models_endpoint_rejects_unavailable_runner(monkeypatch) -> None:
 def test_runner_models_endpoint_falls_back_when_codex_cache_is_missing(
     monkeypatch,
 ) -> None:
+    availability = {
+        "available_runners": ["codex"],
+        "supported_runners": ["opencode", "codex", "claude"],
+        "claude_code_available": False,
+    }
+    monkeypatch.setattr(server, "_detect_runner_availability", lambda: availability)
     monkeypatch.setattr(
-        server,
+        server_runners,
         "_detect_runner_availability",
-        lambda: {
-            "available_runners": ["codex"],
-            "supported_runners": ["opencode", "codex", "claude"],
-            "claude_code_available": False,
-        },
+        lambda _server_module: availability,
     )
 
     def raise_missing_cache(runner: str, *, force_refresh: bool = False):
@@ -1311,6 +1325,13 @@ def test_runner_models_endpoint_falls_back_when_codex_cache_is_missing(
         )
 
     monkeypatch.setattr(server, "_refresh_runner_models_cache", raise_missing_cache)
+    monkeypatch.setattr(
+        server_runners,
+        "_refresh_runner_models_cache",
+        lambda _server_module, runner, *, force_refresh=False: raise_missing_cache(
+            runner, force_refresh=force_refresh
+        ),
+    )
     monkeypatch.setattr(server, "_load_fix_preferences", lambda: ("codex", None, None))
 
     with TestClient(server.create_app()) as client:
